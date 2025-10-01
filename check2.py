@@ -3,13 +3,7 @@ import pandas as pd
 import datetime
 import pytz
 import os
-
-# Tenta importar o plotly com tratamento
-try:
-    import plotly.graph_objects as go
-    PLOTLY_OK = True
-except ImportError:
-    PLOTLY_OK = False
+import plotly.graph_objects as go
 
 # Configurar fuso horário de São Paulo
 TZ = pytz.timezone("America/Sao_Paulo")
@@ -70,20 +64,18 @@ def salvar_checklist(serie, resultados, usuario, foto_etiqueta=None, reinspecao=
             "Data/Hora": data_hora,
             "Produto Reprovado": "Sim" if reprovado else "Não",
             "Reinspeção": "Sim" if reinspecao else "Não",
-            "Foto Etiqueta": ""  # ainda não salvando imagem
+            "Foto Etiqueta": ""  # ainda não estamos salvando a foto
         })
 
     df_novo = pd.DataFrame(dados)
     st.session_state["historico_checklists"] = pd.concat([df_existente, df_novo], ignore_index=True)
     st.session_state["historico_checklists"].to_csv(ARQUIVO_CSV, index=False)
-
     csv_data = st.session_state["historico_checklists"].to_csv(index=False).encode('utf-8')
     st.success(f"Checklist salvo para o Nº de Série {serie}")
     return csv_data
 
 def mostrar_resumo():
     df = st.session_state["historico_checklists"]
-
     if not df.empty:
         total_inspecionados = df["Nº Série"].nunique()
         total_aprovado = df[df["Produto Reprovado"] == "Não"]["Nº Série"].nunique()
@@ -97,59 +89,33 @@ def mostrar_resumo():
         col3.metric("Total Reprovado", total_reprovado)
         col4.metric("% Aprovado", f"{percentual_aprov:.1f}%")
 
-        # --- Gráfico Pareto das falhas ---
-        df_nao_conforme = df[df["Status"] == "Não Conforme"]
-
-        if not df_nao_conforme.empty:
-            st.markdown("### 📉 Pareto de Falhas (Não Conformidades)")
-
-            if not PLOTLY_OK:
-                st.warning("O módulo 'plotly' não está instalado. Para ver o gráfico de Pareto, adicione 'plotly' no requirements.txt ou instale localmente com `pip install plotly`.")
-                return
-
-            falhas_por_item = df_nao_conforme["Item"].value_counts().reset_index()
-            falhas_por_item.columns = ["Item", "Quantidade"]
-            falhas_por_item["% Acumulado"] = falhas_por_item["Quantidade"].cumsum() / falhas_por_item["Quantidade"].sum() * 100
-
-            fig = go.Figure()
-
-            fig.add_trace(go.Bar(
-                x=falhas_por_item["Item"],
-                y=falhas_por_item["Quantidade"],
-                name="Quantidade de Falhas",
-                marker_color="indianred",
-                yaxis="y"
-            ))
-
-            fig.add_trace(go.Scatter(
-                x=falhas_por_item["Item"],
-                y=falhas_por_item["% Acumulado"],
-                name="% Acumulado",
-                yaxis="y2",
-                mode="lines+markers",
-                marker_color="black"
-            ))
-
-            fig.update_layout(
-                title="Pareto das Falhas de Não Conformidade",
-                xaxis=dict(title="Item"),
-                yaxis=dict(title="Quantidade de Falhas"),
-                yaxis2=dict(
-                    title="% Acumulado",
-                    overlaying="y",
-                    side="right",
-                    range=[0, 100],
-                    showgrid=False
-                ),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                height=500
-            )
-
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Nenhuma falha de 'Não Conforme' registrada ainda.")
+        mostrar_pareto(df)
     else:
         st.info("Nenhum checklist registrado ainda.")
+
+def mostrar_pareto(df):
+    df_nc = df[df["Status"] == "Não Conforme"]
+    if df_nc.empty:
+        st.info("Nenhuma não conformidade registrada ainda.")
+        return
+
+    pareto = df_nc["Item"].value_counts().reset_index()
+    pareto.columns = ["Item", "Quantidade"]
+    pareto["% Acumulado"] = pareto["Quantidade"].cumsum() / pareto["Quantidade"].sum() * 100
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=pareto["Item"], y=pareto["Quantidade"], name="Quantidade", marker_color='indianred'))
+    fig.add_trace(go.Scatter(x=pareto["Item"], y=pareto["% Acumulado"], name="% Acumulado", yaxis="y2"))
+
+    fig.update_layout(
+        title="Gráfico de Pareto - Não Conformidades",
+        yaxis=dict(title="Quantidade"),
+        yaxis2=dict(title="% Acumulado", overlaying="y", side="right", range=[0, 100]),
+        xaxis=dict(title="Item"),
+        legend=dict(x=0.85, y=1.15, orientation="h")
+    )
+
+    st.plotly_chart(fig)
 
 def novo_checklist():
     st.markdown("## ✅ Novo Checklist")
@@ -164,10 +130,8 @@ def novo_checklist():
         st.markdown(f"### {item}")
         status = st.radio(f"Status - {item}", ["Conforme", "Não Conforme", "N/A"], key=f"novo_{item}")
         obs = st.text_area(f"Observações - {item}", key=f"obs_novo_{item}")
-
         if item == "Etiqueta":
             foto_etiqueta = st.camera_input("📸 Tire uma foto da Etiqueta")
-
         resultados[item] = {"status": status, "obs": obs}
 
     if st.button("Salvar Checklist"):
@@ -187,7 +151,15 @@ def novo_checklist():
 
 def reinspecao():
     df = st.session_state["historico_checklists"]
-    reprovados = df[df["Produto Reprovado"] == "Sim"]["Nº Série"].unique() if not df.empty else []
+
+    if not df.empty:
+        # Considerar apenas o último registro de cada Nº de Série
+        ultimos = df.sort_values("Data/Hora").groupby("Nº Série").tail(1)
+        reprovados = ultimos[
+            (ultimos["Produto Reprovado"] == "Sim") & (ultimos["Reinspeção"] == "Não")
+        ]["Nº Série"].unique()
+    else:
+        reprovados = []
 
     if len(reprovados) > 0:
         st.markdown("## 🔄 Reinspeção de Produtos Reprovados")
@@ -230,3 +202,4 @@ else:
         novo_checklist()
     with tab3:
         reinspecao()
+
