@@ -2,34 +2,78 @@ import streamlit as st
 import pandas as pd
 import datetime
 import pytz
-import os
 import plotly.graph_objects as go
+from supabase import create_client
+import os
+from dotenv import load_dotenv
+from pathlib import Path
+import base64  # necessário para fotos em base64
 
-# Configurar fuso horário de São Paulo
+# =============================
+# Carregar variáveis de ambiente
+# =============================
+env_path = Path(__file__).parent / "teste.env"
+load_dotenv(dotenv_path=env_path)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# =============================
+# Configuração inicial
+# =============================
 TZ = pytz.timezone("America/Sao_Paulo")
-
-# Lista de itens a verificar
 itens = ["Etiqueta", "Tambor + Parafuso", "Solda", "Pintura", "Borracha ABS"]
+usuarios = {"joao": "1234", "maria": "abcd", "admin": "admin"}
 
-# Usuários cadastrados
-usuarios = {
-    "joao": "1234",
-    "maria": "abcd",
-    "admin": "admin"
-}
+# =============================
+# Funções de Banco (Supabase)
+# =============================
+def carregar_checklists():
+    response = supabase.table("checklists").select("*").execute()
+    df = pd.DataFrame(response.data)
+    if not df.empty:
+        df["data_hora"] = pd.to_datetime(df["data_hora"])
+    return df
 
-# Caminho do arquivo para salvar o histórico
-ARQUIVO_CSV = "checklists.csv"
+def salvar_checklist(serie, resultados, usuario, foto_etiqueta=None, reinspecao=False):
+    # Checa duplicidade
+    existe = supabase.table("checklists").select("numero_serie").eq("numero_serie", serie).execute()
+    if not reinspecao and existe.data:
+        st.error("⚠️ INVÁLIDO! DUPLICIDADE – Este Nº de Série já foi inspecionado.")
+        return None
 
-# Carregar histórico do CSV (ou criar vazio)
-if "historico_checklists" not in st.session_state:
-    try:
-        st.session_state["historico_checklists"] = pd.read_csv(ARQUIVO_CSV)
-    except FileNotFoundError:
-        colunas = ["Nº Série", "Item", "Status", "Observações", "Inspetor", "Data/Hora", "Produto Reprovado", "Reinspeção", "Foto Etiqueta"]
-        st.session_state["historico_checklists"] = pd.DataFrame(columns=colunas)
+    reprovado = any(info['status'] == "Não Conforme" for info in resultados.values())
+    data_hora = datetime.datetime.now(TZ)
 
-# --- Funções ---
+    foto_base64 = None
+    if foto_etiqueta is not None:
+        try:
+            foto_bytes = foto_etiqueta.getvalue()
+            foto_base64 = base64.b64encode(foto_bytes).decode()
+        except Exception as e:
+            st.error(f"Erro ao processar a foto: {e}")
+            foto_base64 = None
+
+    for item, info in resultados.items():
+        supabase.table("checklists").insert({
+            "numero_serie": serie,
+            "item": item,
+            "status": info['status'],
+            "observacoes": info['obs'],
+            "inspetor": usuario,
+            "data_hora": data_hora.isoformat(),
+            "produto_reprovado": "Sim" if reprovado else "Não",
+            "reinspecao": "Sim" if reinspecao else "Não",
+            "foto_etiqueta": foto_base64 if item == "Etiqueta" else None
+        }).execute()
+
+    st.success(f"Checklist salvo no Supabase para o Nº de Série {serie}")
+    return True
+
+# =============================
+# Funções do App
+# =============================
 def login():
     st.session_state['logged_in'] = False
     with st.form("login_form", clear_on_submit=False):
@@ -44,62 +88,50 @@ def login():
             else:
                 st.error("Usuário ou senha inválidos!")
 
-def salvar_checklist(serie, resultados, usuario, foto_etiqueta=None, reinspecao=False):
-    df_existente = st.session_state["historico_checklists"]
-    if not reinspecao and serie in df_existente["Nº Série"].unique():
-        st.error("⚠️ INVÁLIDO! DUPLICIDADE – Este Nº de Série já foi inspecionado.")
-        return None
-
-    dados = []
-    reprovado = any(info['status'] == "Não Conforme" for info in resultados.values())
-    data_hora = datetime.datetime.now(TZ).strftime("%d/%m/%Y %H:%M")
-
-    for item, info in resultados.items():
-        dados.append({
-            "Nº Série": serie,
-            "Item": item,
-            "Status": info['status'],
-            "Observações": info['obs'],
-            "Inspetor": usuario,
-            "Data/Hora": data_hora,
-            "Produto Reprovado": "Sim" if reprovado else "Não",
-            "Reinspeção": "Sim" if reinspecao else "Não",
-            "Foto Etiqueta": ""  # ainda não estamos salvando a foto
-        })
-
-    df_novo = pd.DataFrame(dados)
-    st.session_state["historico_checklists"] = pd.concat([df_existente, df_novo], ignore_index=True)
-    st.session_state["historico_checklists"].to_csv(ARQUIVO_CSV, index=False)
-    csv_data = st.session_state["historico_checklists"].to_csv(index=False).encode('utf-8')
-    st.success(f"Checklist salvo para o Nº de Série {serie}")
-    return csv_data
-
+# =============================
+# Resumo com filtro de datas e Pareto
+# =============================
 def mostrar_resumo():
-    df = st.session_state["historico_checklists"]
-    if not df.empty:
-        total_inspecionados = df["Nº Série"].nunique()
-        total_aprovado = df[df["Produto Reprovado"] == "Não"]["Nº Série"].nunique()
-        total_reprovado = df[df["Produto Reprovado"] == "Sim"]["Nº Série"].nunique()
-        percentual_aprov = (total_aprovado / total_inspecionados * 100) if total_inspecionados > 0 else 0
-
-        st.markdown("## 📊 Resumo do Dia")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Inspecionados", total_inspecionados)
-        col2.metric("Total Aprovado", total_aprovado)
-        col3.metric("Total Reprovado", total_reprovado)
-        col4.metric("% Aprovado", f"{percentual_aprov:.1f}%")
-
-        mostrar_pareto(df)
-    else:
+    df = carregar_checklists()
+    if df.empty:
         st.info("Nenhum checklist registrado ainda.")
-
-def mostrar_pareto(df):
-    df_nc = df[df["Status"] == "Não Conforme"]
-    if df_nc.empty:
-        st.info("Nenhuma não conformidade registrada ainda.")
         return
 
-    pareto = df_nc["Item"].value_counts().reset_index()
+    st.markdown("## 📊 Resumo de Inspeções")
+
+    # Filtro por data
+    min_data = df["data_hora"].min().date()
+    max_data = df["data_hora"].max().date()
+    data_inicial, data_final = st.date_input("Filtrar por Data", [min_data, max_data], min_value=min_data, max_value=max_data)
+
+    # Filtra o dataframe
+    df_filtrado = df[(df["data_hora"].dt.date >= data_inicial) & (df["data_hora"].dt.date <= data_final)]
+    if df_filtrado.empty:
+        st.info("Nenhum checklist registrado neste período.")
+        return
+
+    # Métricas
+    total_inspecionados = df_filtrado["numero_serie"].nunique()
+    total_aprovado = df_filtrado[df_filtrado["produto_reprovado"] == "Não"]["numero_serie"].nunique()
+    total_reprovado = df_filtrado[df_filtrado["produto_reprovado"] == "Sim"]["numero_serie"].nunique()
+    percentual_aprov = (total_aprovado / total_inspecionados * 100) if total_inspecionados > 0 else 0
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Inspecionados", total_inspecionados)
+    col2.metric("Total Aprovado", total_aprovado)
+    col3.metric("Total Reprovado", total_reprovado)
+    col4.metric("% Aprovado", f"{percentual_aprov:.1f}%")
+
+    # Pareto das não conformidades
+    mostrar_pareto(df_filtrado)
+
+def mostrar_pareto(df):
+    df_nc = df[df["status"] == "Não Conforme"]
+    if df_nc.empty:
+        st.info("Nenhuma não conformidade registrada neste período.")
+        return
+
+    pareto = df_nc["item"].value_counts().reset_index()
     pareto.columns = ["Item", "Quantidade"]
     pareto["% Acumulado"] = pareto["Quantidade"].cumsum() / pareto["Quantidade"].sum() * 100
 
@@ -117,6 +149,9 @@ def mostrar_pareto(df):
 
     st.plotly_chart(fig)
 
+# =============================
+# Novo Checklist (estável com camera_input)
+# =============================
 def novo_checklist():
     st.markdown("## ✅ Novo Checklist")
     serie = st.text_input("Nº de Série")
@@ -124,40 +159,42 @@ def novo_checklist():
     st.write(f"Data/Hora: {data_atual}")
 
     resultados = {}
-    foto_etiqueta = None
+
+    # Inicializa foto na sessão para estabilidade
+    if 'foto_etiqueta_temp' not in st.session_state:
+        st.session_state['foto_etiqueta_temp'] = None
 
     for item in itens:
         st.markdown(f"### {item}")
         status = st.radio(f"Status - {item}", ["Conforme", "Não Conforme", "N/A"], key=f"novo_{item}")
         obs = st.text_area(f"Observações - {item}", key=f"obs_novo_{item}")
         if item == "Etiqueta":
-            foto_etiqueta = st.camera_input("📸 Tire uma foto da Etiqueta")
+            foto = st.camera_input("📸 Tire uma foto da Etiqueta")
+            if foto is not None:
+                st.session_state['foto_etiqueta_temp'] = foto
         resultados[item] = {"status": status, "obs": obs}
 
     if st.button("Salvar Checklist"):
         if not serie:
             st.error("Digite o Nº de Série!")
-        elif foto_etiqueta is None:
+        elif st.session_state['foto_etiqueta_temp'] is None:
             st.error("⚠️ É obrigatório tirar foto da Etiqueta!")
         else:
-            csv_data = salvar_checklist(serie, resultados, st.session_state['usuario'], foto_etiqueta=foto_etiqueta)
-            if csv_data:
-                st.download_button(
-                    label="📥 Baixar checklist CSV",
-                    data=csv_data,
-                    file_name=f"Checklist_{serie}_{datetime.datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
-                )
+            salvar_checklist(serie, resultados, st.session_state['usuario'], foto_etiqueta=st.session_state['foto_etiqueta_temp'])
+            # Limpa a foto da sessão após salvar
+            st.session_state['foto_etiqueta_temp'] = None
 
+# =============================
+# Reinspeção
+# =============================
 def reinspecao():
-    df = st.session_state["historico_checklists"]
+    df = carregar_checklists()
 
     if not df.empty:
-        # Considerar apenas o último registro de cada Nº de Série
-        ultimos = df.sort_values("Data/Hora").groupby("Nº Série").tail(1)
+        ultimos = df.sort_values("data_hora").groupby("numero_serie").tail(1)
         reprovados = ultimos[
-            (ultimos["Produto Reprovado"] == "Sim") & (ultimos["Reinspeção"] == "Não")
-        ]["Nº Série"].unique()
+            (ultimos["produto_reprovado"] == "Sim") & (ultimos["reinspecao"] == "Não")
+        ]["numero_serie"].unique()
     else:
         reprovados = []
 
@@ -174,18 +211,49 @@ def reinspecao():
                 resultados[item] = {"status": status, "obs": obs}
 
             if st.button("Salvar Reinspeção"):
-                csv_data = salvar_checklist(serie_sel, resultados, st.session_state['usuario'], reinspecao=True)
-                if csv_data:
-                    st.download_button(
-                        label="📥 Baixar checklist CSV (Reinspeção)",
-                        data=csv_data,
-                        file_name=f"Checklist_Reinspecao_{serie_sel}_{datetime.datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv"
-                    )
+                salvar_checklist(serie_sel, resultados, st.session_state['usuario'], reinspecao=True)
     else:
         st.info("Nenhum produto reprovado para reinspeção.")
 
-# --- Início do app ---
+# =============================
+# Histórico
+# =============================
+def mostrar_historico():
+    df = carregar_checklists()
+    if df.empty:
+        st.info("Nenhum checklist registrado ainda.")
+        return
+
+    st.markdown("## 📚 Histórico de Checklists")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        filtro_usuario = st.selectbox("Filtrar por Inspetor", ["Todos"] + sorted(df["inspetor"].unique()))
+    with col2:
+        filtro_status = st.selectbox("Filtrar por Produto Reprovado", ["Todos", "Sim", "Não"])
+
+    df_filtrado = df.copy()
+    if filtro_usuario != "Todos":
+        df_filtrado = df_filtrado[df_filtrado["inspetor"] == filtro_usuario]
+    if filtro_status != "Todos":
+        df_filtrado = df_filtrado[df_filtrado["produto_reprovado"] == filtro_status]
+
+    df_filtrado = df_filtrado.sort_values("data_hora", ascending=False)
+
+    st.dataframe(df_filtrado[[
+        "data_hora", "numero_serie", "item", "status", "observacoes",
+        "inspetor", "produto_reprovado", "reinspecao"
+    ]], height=400)
+
+    for idx, row in df_filtrado.iterrows():
+        if row["item"] == "Etiqueta" and row["foto_etiqueta"]:
+            st.markdown(f"**Nº Série: {row['numero_serie']}**")
+            foto_bytes = base64.b64decode(row["foto_etiqueta"])
+            st.image(foto_bytes, width=200)
+
+# =============================
+# Início do app
+# =============================
 st.set_page_config(page_title="Checklist de Qualidade", layout="wide")
 
 if 'logged_in' not in st.session_state:
@@ -194,12 +262,12 @@ elif not st.session_state['logged_in']:
     login()
 else:
     st.subheader(f"Checklist de Qualidade - Inspetor: {st.session_state['usuario']}")
-    tab1, tab2, tab3 = st.tabs(["📊 Resumo", "✅ Novo Checklist", "🔄 Reinspeção"])
-
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Resumo", "✅ Novo Checklist", "🔄 Reinspeção", "📚 Histórico"])
     with tab1:
         mostrar_resumo()
     with tab2:
         novo_checklist()
     with tab3:
         reinspecao()
-
+    with tab4:
+        mostrar_historico()
