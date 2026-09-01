@@ -5,8 +5,8 @@ package.domain = br.com.ibero
 source.dir = .
 source.include_exts = py,png,jpg,jpeg,json,txt,env,sql
 source.exclude_dirs = .git,.github,__pycache__,bin,.buildozer
-version = 0.3.0
-requirements = python3,kivy==2.3.1,requests
+version = 0.4.0
+requirements = python3,kivy==2.3.1
 orientation = landscape
 fullscreen = 0
 icon.filename = assets/icon.png
