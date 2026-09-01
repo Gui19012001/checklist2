@@ -6,8 +6,9 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
-import requests
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
@@ -114,14 +115,41 @@ class SupabaseAPI:
     @property
     def configured(self): return bool(self.url and self.anon)
     def rpc(self,name,payload=None,timeout=15):
-        if not self.configured: raise RuntimeError("SUPABASE_URL / SUPABASE_ANON_KEY não configurados em tablet.env.")
-        body=dict(payload or {})
-        r=requests.post(f"{self.url}/rest/v1/rpc/{name}",headers={
-            "apikey":self.anon,"Authorization":f"Bearer {self.anon}","Content-Type":"application/json","Accept":"application/json"
-        },json=body,timeout=timeout)
-        if not (200 <= r.status_code < 300): raise RuntimeError(f"HTTP {r.status_code}: {r.text[:500]}")
-        if not r.text.strip(): return None
-        return r.json()
+        if not self.configured:
+            raise RuntimeError("SUPABASE_URL / SUPABASE_ANON_KEY não configurados em tablet.env.")
+
+        body = json.dumps(
+            dict(payload or {}),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        req = Request(
+            f"{self.url}/rest/v1/rpc/{name}",
+            data=body,
+            headers={
+                "apikey": self.anon,
+                "Authorization": f"Bearer {self.anon}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+                if not raw.strip():
+                    return None
+                return json.loads(raw)
+        except HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {exc.code}: {raw[:500]}") from exc
+        except URLError as exc:
+            reason = getattr(exc, "reason", exc)
+            raise RuntimeError(f"Falha de conexão com o Supabase: {reason}") from exc
+        except TimeoutError as exc:
+            raise RuntimeError("Tempo esgotado ao comunicar com o Supabase.") from exc
     def machines(self): return self.rpc("aps_tablet_maquinas")
     def queue(self,machine): return self.rpc("aps_tablet_fila_serra",{"p_maquina":machine})
     def start(self,operation_id,machine,operator,setup,device_id):
