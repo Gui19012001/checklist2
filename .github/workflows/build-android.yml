@@ -1,0 +1,38 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Criar configuração do tablet
+        shell: bash
+        run: |
+          cat > tablet.env <<'EOF'
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
+          EOF
+      - name: Dependências Linux
+        run: |
+          sudo apt update
+          sudo apt install -y ant autoconf automake ccache cmake g++ gcc gettext git lbzip2 libffi-dev libltdl-dev libncurses5-dev libncursesw5-dev libssl-dev libtool libtinfo6 make patch pkg-config unzip zip zlib1g-dev
+      - name: Buildozer
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install "cython<3" buildozer
+          yes | buildozer android debug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aps-serra-operacao-online-apk
+          path: bin/*.apk
+          if-no-files-found: error
