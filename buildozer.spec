@@ -6,7 +6,7 @@ source.dir = .
 source.include_exts = py,png,jpg,jpeg,json,txt,env,sql
 source.exclude_dirs = .git,.github,__pycache__,bin,.buildozer
 version = 0.4.0
-requirements = python3,kivy==2.3.1
+requirements = python3,kivy==2.3.1,charset-normalizer==3.4.9
 orientation = landscape
 fullscreen = 0
 icon.filename = assets/icon.png
