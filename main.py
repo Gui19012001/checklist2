@@ -3,12 +3,18 @@ from __future__ import annotations
 import json
 import os
 import sys
+import ssl
 import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+try:
+    import certifi
+except Exception:
+    certifi = None
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -566,10 +572,29 @@ class SupabaseAPI:
         )
 
         try:
-            with urlopen(
-                req,
-                timeout=timeout,
-            ) as resp:
+            ssl_context = None
+
+            if self.url.lower().startswith("https://"):
+                if certifi is not None:
+                    ssl_context = ssl.create_default_context(
+                        cafile=certifi.where()
+                    )
+                else:
+                    ssl_context = ssl.create_default_context()
+
+            if ssl_context is not None:
+                response = urlopen(
+                    req,
+                    timeout=timeout,
+                    context=ssl_context,
+                )
+            else:
+                response = urlopen(
+                    req,
+                    timeout=timeout,
+                )
+
+            with response as resp:
                 raw = (
                     resp.read()
                     .decode("utf-8")
@@ -972,20 +997,37 @@ class OperationScreen(Screen):
 
         app = App.get_running_app()
 
-        app.operator = (
-            self.operator.text.strip()
-        )
-        app.machine = self.machine.text
+        try:
+            app.operator = (
+                self.operator.text.strip()
+            )
+            app.machine = self.machine.text
 
-        app.store.data["config"] = {
-            "machine": app.machine,
-            "last_operator": (
-                app.operator
-            ),
-        }
+            app.store.data["config"] = {
+                "machine": app.machine,
+                "last_operator": (
+                    app.operator
+                ),
+            }
 
-        app.store.save()
-        self.refresh_remote()
+            app.store.save()
+            self.refresh_remote()
+
+        except Exception as e:
+            app.online = False
+
+            try:
+                save_crash_report(
+                    traceback.format_exc(),
+                    app,
+                )
+            except Exception:
+                pass
+
+            self.popup(
+                "ERRO AO CARREGAR FILA",
+                str(e),
+            )
 
     def load_cached(self):
         app = App.get_running_app()
@@ -1044,7 +1086,7 @@ class OperationScreen(Screen):
                     plan = {}
 
                 Clock.schedule_once(
-                    lambda *_:
+                    lambda *_args, rows=rows, plan=plan:
                     self._refresh_ok(
                         rows,
                         plan,
@@ -1053,11 +1095,25 @@ class OperationScreen(Screen):
                 )
 
             except Exception as e:
+                # IMPORTANTE:
+                # A variável de exceção "e" é apagada pelo Python ao sair
+                # do bloco except. Se ela for usada diretamente dentro de
+                # um lambda executado depois pelo Clock, o callback pode
+                # gerar NameError e derrubar o processo do Kivy.
+                error_message = str(e)
+                error_trace = traceback.format_exc()
+
+                try:
+                    save_crash_report(
+                        error_trace,
+                        app,
+                    )
+                except Exception:
+                    pass
+
                 Clock.schedule_once(
-                    lambda *_:
-                    self._refresh_fail(
-                        str(e)
-                    ),
+                    lambda *_args, msg=error_message:
+                    self._refresh_fail(msg),
                     0,
                 )
 
@@ -1094,24 +1150,58 @@ class OperationScreen(Screen):
         self.busy = False
         app.online = False
 
-        self.render_header()
+        try:
+            self.render_header()
+        except Exception:
+            pass
 
-        app.store.event(
-            f"Falha de comunicação: {msg}"
-        )
+        try:
+            app.store.event(
+                f"Falha de comunicação: {msg}"
+            )
+        except Exception:
+            pass
 
-        self.show_operation()
+        try:
+            self.show_operation()
+        except Exception:
+            pass
 
-        self.popup(
-            "SEM COMUNICAÇÃO",
-            (
-                "Não foi possível atualizar "
-                "o Supabase.\n\n"
-                f"{msg}\n\n"
-                "A última fila salva permanece "
-                "visível."
-            ),
-        )
+        try:
+            self.popup(
+                "SEM COMUNICAÇÃO",
+                (
+                    "Não foi possível atualizar "
+                    "o Supabase.\n\n"
+                    f"{msg}\n\n"
+                    "A última fila salva permanece "
+                    "visível."
+                ),
+            )
+        except Exception:
+            # Último fallback: se até o Popup falhar, substitui o conteúdo
+            # por uma mensagem simples sem encerrar o aplicativo.
+            try:
+                self.content.clear_widgets()
+                self.content.add_widget(
+                    lbl(
+                        "ERRO AO CARREGAR FILA",
+                        C_RED,
+                        sp(20),
+                        dp(50),
+                        True,
+                    )
+                )
+                self.content.add_widget(
+                    lbl(
+                        str(msg),
+                        C_TEXT,
+                        sp(12),
+                        dp(120),
+                    )
+                )
+            except Exception:
+                pass
 
     def current(self):
         opened = [
