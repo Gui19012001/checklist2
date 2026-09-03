@@ -8,7 +8,7 @@ source.include_exts = py,png,jpg,jpeg,json,txt,env,sql
 source.exclude_dirs = .git,.github,__pycache__,bin,.buildozer
 
 # Versão operacional com turnos / parcial / fila lateral
-version = 0.5.1
+version = 0.5.3
 
 requirements = python3,kivy==2.3.1,certifi
 
