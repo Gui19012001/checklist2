@@ -453,63 +453,73 @@ def lbl(
 
 class LocalStore:
     def __init__(self, app):
-        self.path = (
-            Path(app.user_data_dir)
-            / "aps_serra_tablet_online.json"
-        )
-
-        self.path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        self.path = Path(app.user_data_dir) / "aps_serra_tablet_online.json"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
 
         self.data = {
             "config": {
-                "machine": "SER-01",
+                "machine": "SER-04",
+                "machine_1": "SER-04",
+                "machine_2": "SER-05",
+                "selected_machine": "SER-04",
                 "last_operator": "",
             },
             "orders": [],
+            "plan": {},
+            "machine_cache": {},
             "events": [],
         }
 
         if self.path.exists():
             try:
-                self.data.update(
-                    json.loads(
-                        self.path.read_text(
-                            encoding="utf-8"
-                        )
-                    )
-                )
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    self.data.update(loaded)
             except Exception:
                 pass
 
+        cfg = self.data.setdefault("config", {})
+        legacy_machine = str(cfg.get("machine") or "SER-04").strip().upper()
+        m1 = str(cfg.get("machine_1") or legacy_machine or "SER-04").strip().upper()
+        m2 = str(cfg.get("machine_2") or ("SER-05" if m1 != "SER-05" else "SER-04")).strip().upper()
+        if m1 == m2:
+            m2 = "SER-05" if m1 != "SER-05" else "SER-04"
+
+        selected = str(cfg.get("selected_machine") or m1).strip().upper()
+        if selected not in (m1, m2):
+            selected = m1
+
+        cfg.update({
+            "machine": selected,
+            "machine_1": m1,
+            "machine_2": m2,
+            "selected_machine": selected,
+            "last_operator": str(cfg.get("last_operator") or ""),
+        })
+
+        cache = self.data.setdefault("machine_cache", {})
+        if legacy_machine and legacy_machine not in cache:
+            old_orders = self.data.get("orders", [])
+            old_plan = self.data.get("plan", {}) or {}
+            if old_orders or old_plan:
+                cache[legacy_machine] = {
+                    "orders": old_orders,
+                    "plan": old_plan,
+                    "online": None,
+                }
+
     def save(self):
         self.path.write_text(
-            json.dumps(
-                self.data,
-                ensure_ascii=False,
-                indent=2,
-            ),
+            json.dumps(self.data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
     def event(self, text):
-        self.data.setdefault(
-            "events",
-            [],
-        ).insert(
+        self.data.setdefault("events", []).insert(
             0,
-            {
-                "at": now_iso(),
-                "text": text,
-            },
+            {"at": now_iso(), "text": text},
         )
-
-        self.data["events"] = (
-            self.data["events"][:100]
-        )
-
+        self.data["events"] = self.data["events"][:100]
         self.save()
 
 
@@ -797,8 +807,17 @@ def safe_float(value, default=0.0):
         return float(default)
 
 
+def machine_display(code):
+    """SER-04 -> SERRA 4. Mantém outros códigos legíveis."""
+    value = str(code or "").strip().upper()
+    m = re.fullmatch(r"SER[-_ ]?0*(\d+)", value)
+    if m:
+        return f"SERRA {int(m.group(1))}"
+    return value or "SERRA"
+
+
 # ============================================================
-# TELA OPERACIONAL 0.5.2
+# TELA OPERACIONAL 0.5.3 · DUAS MÁQUINAS
 # ============================================================
 
 class OperationScreen(Screen):
@@ -806,47 +825,61 @@ class OperationScreen(Screen):
 
     def __init__(self, **kw):
         super().__init__(**kw)
-        self.busy = False
         self.orders = []
         self.plan = {}
-        self.shift_prompt_exec_id = None
+        self.machine_states = {}
+        self.busy_machines = set()
+        self.machine_tab_buttons = {}
+        self.selected_machine_code = None
+        self.shift_prompt_exec_ids = {}
         self.shift_popup = None
 
         root = BoxLayout(
             orientation="vertical",
             padding=[dp(12), dp(8), dp(12), dp(10)],
-            spacing=dp(8),
+            spacing=dp(7),
         )
         self.add_widget(root)
 
-        self.header = BoxLayout(size_hint_y=None, height=dp(64))
+        self.header = BoxLayout(size_hint_y=None, height=dp(60))
         root.add_widget(self.header)
 
         self.identity = Card(
             orientation="horizontal",
             size_hint_y=None,
-            height=dp(66),
-            padding=[dp(12), dp(7)],
-            spacing=dp(8),
+            height=dp(64),
+            padding=[dp(10), dp(6)],
+            spacing=dp(7),
         )
         root.add_widget(self.identity)
+
+        self.machine_bar = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(74),
+            spacing=dp(8),
+        )
+        root.add_widget(self.machine_bar)
 
         self.body = BoxLayout(orientation="horizontal", spacing=dp(9))
         root.add_widget(self.body)
 
-        self.footer = BoxLayout(size_hint_y=None, height=dp(28))
+        self.footer = BoxLayout(size_hint_y=None, height=dp(26))
         root.add_widget(self.footer)
 
         self.build_identity()
+        self.load_cached()
+        self.render_machine_tabs()
         self.render_header()
         self.render_footer()
 
         Clock.schedule_interval(self._tick, 1.0)
         Clock.schedule_interval(self.check_shift_boundary, 20.0)
+        Clock.schedule_interval(lambda *_: self.refresh_all(silent=True), 60.0)
 
     def on_pre_enter(self, *_):
         self.load_cached()
-        Clock.schedule_once(lambda *_: self.refresh_remote(), .35)
+        Clock.schedule_once(lambda *_: self.refresh_all(silent=True), .35)
         Clock.schedule_once(lambda *_: self.check_shift_boundary(), 1.5)
 
     # --------------------------------------------------------
@@ -856,22 +889,30 @@ class OperationScreen(Screen):
     def render_header(self):
         self.header.clear_widgets()
         app = App.get_running_app()
+        machine = self.selected_machine()
+        state = self._state(machine)
 
-        c = Card(orientation="horizontal", padding=[dp(15), dp(7)], spacing=dp(8))
-        left = BoxLayout(orientation="vertical", size_hint_x=.55)
-        left.add_widget(lbl("APS SERRA · OPERAÇÃO", C_TEXT, sp(20), dp(30), True))
-        plan_text = compact_plan_ref(self.plan)
-        left.add_widget(lbl(plan_text, C_MUTED, sp(10), dp(20)))
+        c = Card(orientation="horizontal", padding=[dp(14), dp(6)], spacing=dp(8))
+        left = BoxLayout(orientation="vertical", size_hint_x=.58)
+        left.add_widget(lbl(f"APS SERRA · {machine_display(machine)}", C_TEXT, sp(20), dp(29), True))
+        left.add_widget(lbl(compact_plan_ref(self.plan), C_MUTED, sp(9), dp(19)))
         c.add_widget(left)
 
-        middle = BoxLayout(orientation="vertical", size_hint_x=.25)
-        self.clock_label = lbl("", C_TEXT, sp(18), dp(30), True)
-        self.shift_label = lbl("", C_MUTED, sp(10), dp(20), True)
+        middle = BoxLayout(orientation="vertical", size_hint_x=.24)
+        self.clock_label = lbl("", C_TEXT, sp(17), dp(28), True)
+        self.shift_label = lbl("", C_MUTED, sp(9), dp(19), True)
         middle.add_widget(self.clock_label)
         middle.add_widget(self.shift_label)
         c.add_widget(middle)
 
-        c.add_widget(Status("ONLINE" if app.online else "OFFLINE", "OK" if app.online else "BAD"))
+        online = state.get("online")
+        if online is True:
+            c.add_widget(Status("ONLINE", "OK"))
+        elif online is False:
+            c.add_widget(Status("OFFLINE", "BAD"))
+        else:
+            c.add_widget(Status("AGUARDANDO", "WAIT"))
+
         self.header.add_widget(c)
         self._tick()
 
@@ -898,37 +939,160 @@ class OperationScreen(Screen):
     def build_identity(self):
         self.identity.clear_widgets()
         app = App.get_running_app()
+        cfg = app.store.data.get("config", {})
 
-        opbox = BoxLayout(orientation="vertical", size_hint_x=.42, spacing=dp(1))
-        opbox.add_widget(lbl("OPERADOR", C_MUTED, sp(9), dp(18), True))
+        opbox = BoxLayout(orientation="vertical", size_hint_x=.35, spacing=dp(1))
+        opbox.add_widget(lbl("OPERADOR", C_MUTED, sp(8), dp(17), True))
         self.operator = Field(hint_text="Nome do operador")
-        self.operator.text = app.store.data.get("config", {}).get("last_operator", "")
+        self.operator.text = cfg.get("last_operator", "")
         opbox.add_widget(self.operator)
 
-        mbox = BoxLayout(orientation="vertical", size_hint_x=.22, spacing=dp(1))
-        mbox.add_widget(lbl("MÁQUINA", C_MUTED, sp(9), dp(18), True))
-        self.machine = Spinner(
-            text=app.store.data.get("config", {}).get("machine", "SER-01"),
-            values=("SER-01", "SER-02", "SER-03", "SER-04", "SER-05"),
-            background_normal="",
-            background_color=C_DARK,
-            color=C_TEXT,
-            size_hint_y=None,
-            height=dp(46),
-            font_size=sp(14),
+        values = ("SER-01", "SER-02", "SER-03", "SER-04", "SER-05")
+
+        a = BoxLayout(orientation="vertical", size_hint_x=.17, spacing=dp(1))
+        a.add_widget(lbl("TELA A", C_MUTED, sp(8), dp(17), True))
+        self.machine_a = Spinner(
+            text=cfg.get("machine_1", "SER-04"),
+            values=values, background_normal="", background_color=C_DARK,
+            color=C_TEXT, size_hint_y=None, height=dp(44), font_size=sp(13),
         )
-        mbox.add_widget(self.machine)
+        a.add_widget(self.machine_a)
 
-        load_btn = FlatButton("ATUALIZAR FILA", bg=C_BLUE, size_hint_x=.20, height=dp(46))
+        b = BoxLayout(orientation="vertical", size_hint_x=.17, spacing=dp(1))
+        b.add_widget(lbl("TELA B", C_MUTED, sp(8), dp(17), True))
+        self.machine_b = Spinner(
+            text=cfg.get("machine_2", "SER-05"),
+            values=values, background_normal="", background_color=C_DARK,
+            color=C_TEXT, size_hint_y=None, height=dp(44), font_size=sp(13),
+        )
+        b.add_widget(self.machine_b)
+
+        load_btn = FlatButton("ATUALIZAR AS 2", bg=C_BLUE, size_hint_x=.19, height=dp(44))
         load_btn.bind(on_release=lambda *_: self.apply_identity())
-
-        hist_btn = FlatButton("HISTÓRICO", bg=C_DARK, size_hint_x=.16, height=dp(46))
+        hist_btn = FlatButton("HISTÓRICO", bg=C_DARK, size_hint_x=.12, height=dp(44))
         hist_btn.bind(on_release=lambda *_: self.show_history_popup())
 
         self.identity.add_widget(opbox)
-        self.identity.add_widget(mbox)
+        self.identity.add_widget(a)
+        self.identity.add_widget(b)
         self.identity.add_widget(load_btn)
         self.identity.add_widget(hist_btn)
+
+    def configured_machines(self):
+        if hasattr(self, "machine_a") and hasattr(self, "machine_b"):
+            values = [self.machine_a.text.strip().upper(), self.machine_b.text.strip().upper()]
+        else:
+            cfg = App.get_running_app().store.data.get("config", {})
+            values = [
+                str(cfg.get("machine_1") or "SER-04").strip().upper(),
+                str(cfg.get("machine_2") or "SER-05").strip().upper(),
+            ]
+        out = []
+        for value in values:
+            if value and value not in out:
+                out.append(value)
+        return out
+
+    def selected_machine(self):
+        machines = self.configured_machines()
+        if self.selected_machine_code in machines:
+            return self.selected_machine_code
+        if machines:
+            self.selected_machine_code = machines[0]
+            return machines[0]
+        return "SER-04"
+
+    def _state(self, machine):
+        machine = str(machine or "").strip().upper()
+        if machine not in self.machine_states:
+            self.machine_states[machine] = {"orders": [], "plan": {}, "online": None}
+        return self.machine_states[machine]
+
+    def _active_from_orders(self, orders):
+        for order in orders or []:
+            s = str(order.get("status", "")).upper()
+            if s in self.ACTIVE_STATUSES and order.get("active_execution_id"):
+                return order
+        return None
+
+    def _current_from_orders(self, orders):
+        active = self._active_from_orders(orders)
+        if active:
+            return active
+        opened = [o for o in (orders or []) if str(o.get("status", "")).upper() != "CONCLUIDA"]
+        opened.sort(key=lambda o: int(o.get("seq", 999999) or 999999))
+        return opened[0] if opened else None
+
+    def machine_tab_summary(self, machine):
+        state = self._state(machine)
+        current = self._current_from_orders(state.get("orders", []))
+        if state.get("online") is False and not current:
+            return "OFFLINE\nSEM DADOS"
+        if not current:
+            return "SEM FILA\n—"
+        status = str(current.get("status") or "AGUARDANDO").replace("_", " ")
+        item = str(current.get("item") or "").strip() or "SEM ITEM"
+        if len(item) > 22:
+            item = item[:20] + "…"
+        if current.get("active_execution_id"):
+            start = hhmm(current.get("active_inicio_em"))
+            return f"{status} · {start}\n{item}"
+        return f"{status}\nPRÓX: {item}"
+
+    def render_machine_tabs(self):
+        if not hasattr(self, "machine_bar"):
+            return
+        self.machine_bar.clear_widgets()
+        self.machine_tab_buttons = {}
+
+        for machine in self.configured_machines():
+            selected = machine == self.selected_machine()
+            state = self._state(machine)
+            current = self._current_from_orders(state.get("orders", []))
+            active = bool(current and current.get("active_execution_id"))
+
+            if selected:
+                bg, fg, prefix = C_BLUE, C_TEXT, "▶ "
+            elif active:
+                bg, fg, prefix = (.055, .25, .19, 1), C_GREEN, "● "
+            elif state.get("online") is False:
+                bg, fg, prefix = (.24, .07, .09, 1), C_RED, "⚠ "
+            else:
+                bg, fg, prefix = C_DARK, C_TEXT, ""
+
+            btn = Button(
+                text=f"[b]{prefix}{machine_display(machine)}[/b]\n[size=11sp]{self.machine_tab_summary(machine)}[/size]",
+                markup=True, background_normal="", background_down="",
+                background_color=bg, color=fg, bold=True, font_size=sp(16),
+                halign="center", valign="middle",
+            )
+            btn.bind(size=lambda instance, _value: setattr(instance, "text_size", instance.size))
+            btn.bind(on_release=lambda *_args, m=machine: self.switch_machine(m))
+            self.machine_tab_buttons[machine] = btn
+            self.machine_bar.add_widget(btn)
+
+    def switch_machine(self, machine, refresh=True):
+        machine = str(machine or "").strip().upper()
+        if machine not in self.configured_machines():
+            return
+        self.selected_machine_code = machine
+        app = App.get_running_app()
+        app.machine = machine
+        state = self._state(machine)
+        self.orders = state.get("orders", []) or []
+        self.plan = state.get("plan", {}) or {}
+        app.online = bool(state.get("online")) if state.get("online") is not None else False
+
+        cfg = app.store.data.setdefault("config", {})
+        cfg["selected_machine"] = machine
+        cfg["machine"] = machine
+        app.store.save()
+
+        self.render_machine_tabs()
+        self.render_header()
+        self.render_workspace()
+        if refresh:
+            self.refresh_remote(machine, silent=True)
 
     def operator_ok(self, show=True):
         name = self.operator.text.strip()
@@ -939,23 +1103,43 @@ class OperationScreen(Screen):
     def apply_identity(self):
         if not self.operator_ok():
             return
+
+        machine_1 = self.machine_a.text.strip().upper()
+        machine_2 = self.machine_b.text.strip().upper()
+        if not machine_1 or not machine_2:
+            self.popup("MÁQUINAS OBRIGATÓRIAS", "Escolha as duas máquinas do tablet.")
+            return
+        if machine_1 == machine_2:
+            self.popup("MÁQUINAS IGUAIS", "TELA A e TELA B precisam representar máquinas diferentes.")
+            return
+
         app = App.get_running_app()
         try:
             app.operator = self.operator.text.strip()
-            app.machine = self.machine.text
-            app.store.data["config"] = {
-                "machine": app.machine,
+            cfg = app.store.data.setdefault("config", {})
+            cfg.update({
+                "machine_1": machine_1,
+                "machine_2": machine_2,
                 "last_operator": app.operator,
-            }
+            })
+            if self.selected_machine_code not in (machine_1, machine_2):
+                self.selected_machine_code = machine_1
+            cfg["selected_machine"] = self.selected_machine_code
+            cfg["machine"] = self.selected_machine_code
+            app.machine = self.selected_machine_code
+            self._state(machine_1)
+            self._state(machine_2)
             app.store.save()
-            self.refresh_remote()
+            self.render_machine_tabs()
+            self.switch_machine(self.selected_machine_code, refresh=False)
+            self.refresh_all(silent=False)
         except Exception as e:
             app.online = False
             try:
                 save_crash_report(traceback.format_exc(), app)
             except Exception:
                 pass
-            self.popup("ERRO AO CARREGAR FILA", str(e))
+            self.popup("ERRO AO CARREGAR FILAS", str(e))
 
     # --------------------------------------------------------
     # DADOS / REFRESH
@@ -963,75 +1147,129 @@ class OperationScreen(Screen):
 
     def load_cached(self):
         app = App.get_running_app()
-        self.orders = app.store.data.get("orders", [])
-        self.plan = app.store.data.get("plan", {}) or {}
+        cfg = app.store.data.setdefault("config", {})
+        machine_1 = str(cfg.get("machine_1") or "SER-04").strip().upper()
+        machine_2 = str(cfg.get("machine_2") or "SER-05").strip().upper()
+        if machine_1 == machine_2:
+            machine_2 = "SER-05" if machine_1 != "SER-05" else "SER-04"
+
+        if hasattr(self, "machine_a"):
+            self.machine_a.text = machine_1
+        if hasattr(self, "machine_b"):
+            self.machine_b.text = machine_2
+
+        cache = app.store.data.setdefault("machine_cache", {})
+        for machine in (machine_1, machine_2):
+            saved = cache.get(machine, {}) or {}
+            self.machine_states[machine] = {
+                "orders": saved.get("orders", []) or [],
+                "plan": saved.get("plan", {}) or {},
+                "online": saved.get("online"),
+            }
+
+        selected = str(cfg.get("selected_machine") or machine_1).strip().upper()
+        if selected not in (machine_1, machine_2):
+            selected = machine_1
+        self.selected_machine_code = selected
+        state = self._state(selected)
+        self.orders = state.get("orders", []) or []
+        self.plan = state.get("plan", {}) or {}
+        app.machine = selected
+        app.online = bool(state.get("online")) if state.get("online") is not None else False
+        self.render_machine_tabs()
         self.render_header()
         self.render_workspace()
 
-    def refresh_remote(self):
-        if self.busy:
-            return
-        if not self.operator_ok(False):
-            self.render_workspace()
-            return
-
+    def _persist_machine_state(self, machine):
         app = App.get_running_app()
-        app.operator = self.operator.text.strip()
-        app.machine = self.machine.text
-        self.busy = True
+        state = self._state(machine)
+        cache = app.store.data.setdefault("machine_cache", {})
+        cache[machine] = {
+            "orders": state.get("orders", []) or [],
+            "plan": state.get("plan", {}) or {},
+            "online": state.get("online"),
+        }
+        if machine == self.selected_machine():
+            app.store.data["orders"] = cache[machine]["orders"]
+            app.store.data["plan"] = cache[machine]["plan"]
+        app.store.save()
+
+    def refresh_all(self, silent=True):
+        for machine in self.configured_machines():
+            self.refresh_remote(machine, silent=silent)
+
+    def refresh_remote(self, machine=None, silent=False):
+        machine = str(machine or self.selected_machine()).strip().upper()
+        if not machine or machine in self.busy_machines:
+            return
+        app = App.get_running_app()
+        self.busy_machines.add(machine)
 
         def work():
             try:
-                data = app.api.queue(app.machine)
+                data = app.api.queue(machine)
                 if isinstance(data, dict):
                     rows = data.get("orders", []) or []
                     plan = data.get("plan", {}) or {}
                 else:
                     rows, plan = data or [], {}
-
                 Clock.schedule_once(
-                    lambda *_args, rows=rows, plan=plan: self._refresh_ok(rows, plan), 0
+                    lambda *_args, m=machine, rows=rows, plan=plan: self._refresh_ok_machine(m, rows, plan),
+                    0,
                 )
             except Exception as e:
                 msg = str(e)
-                trace = traceback.format_exc()
                 try:
-                    save_crash_report(trace, app)
+                    save_crash_report(traceback.format_exc(), app)
                 except Exception:
                     pass
                 Clock.schedule_once(
-                    lambda *_args, msg=msg: self._refresh_fail(msg), 0
+                    lambda *_args, m=machine, msg=msg, silent=silent: self._refresh_fail_machine(m, msg, silent),
+                    0,
                 )
-
         threading.Thread(target=work, daemon=True).start()
 
-    def _refresh_ok(self, rows, plan):
+    def _refresh_ok_machine(self, machine, rows, plan):
         app = App.get_running_app()
-        self.busy = False
-        app.online = True
-        self.orders = rows
-        self.plan = plan or {}
-        app.store.data["orders"] = rows
-        app.store.data["plan"] = self.plan
-        app.store.save()
-        self.render_header()
-        self.render_workspace()
+        self.busy_machines.discard(machine)
+        state = self._state(machine)
+        state["orders"] = rows
+        state["plan"] = plan or {}
+        state["online"] = True
+        self._persist_machine_state(machine)
+        if machine == self.selected_machine():
+            self.orders = rows
+            self.plan = plan or {}
+            app.machine = machine
+            app.online = True
+            self.render_header()
+            self.render_workspace()
+        self.render_machine_tabs()
         Clock.schedule_once(lambda *_: self.check_shift_boundary(), .2)
 
-    def _refresh_fail(self, msg):
+    def _refresh_fail_machine(self, machine, msg, silent):
         app = App.get_running_app()
-        self.busy = False
-        app.online = False
-        self.render_header()
+        self.busy_machines.discard(machine)
+        state = self._state(machine)
+        state["online"] = False
+        self._persist_machine_state(machine)
         try:
-            app.store.event(f"Falha de comunicação: {msg}")
+            app.store.event(f"{machine_display(machine)} · falha de comunicação: {msg}")
         except Exception:
             pass
-        self.render_workspace()
-        self.popup(
-            "SEM COMUNICAÇÃO",
-            f"Não foi possível atualizar o Supabase.\n\n{msg}\n\nA última fila salva permanece visível.",
-        )
+        if machine == self.selected_machine():
+            self.orders = state.get("orders", []) or []
+            self.plan = state.get("plan", {}) or {}
+            app.machine = machine
+            app.online = False
+            self.render_header()
+            self.render_workspace()
+        self.render_machine_tabs()
+        if not silent:
+            self.popup(
+                f"{machine_display(machine)} · SEM COMUNICAÇÃO",
+                f"Não foi possível atualizar o Supabase.\n\n{msg}\n\nA última fila salva permanece visível.",
+            )
 
     # --------------------------------------------------------
     # FILA / ORDEM ATUAL
@@ -1116,13 +1354,18 @@ class OperationScreen(Screen):
         if not o:
             c = Card(orientation="vertical", padding=dp(22))
             c.add_widget(lbl("FILA CONCLUÍDA", C_GREEN, sp(26), dp(58), True))
-            c.add_widget(lbl(f"Nenhuma ordem aberta para {app.machine}.", C_MUTED, sp(13), dp(38)))
+            c.add_widget(lbl(f"Nenhuma ordem aberta para {machine_display(self.selected_machine())}.", C_MUTED, sp(13), dp(38)))
             parent.add_widget(c)
             return
 
         c = Card(orientation="vertical", padding=dp(16), spacing=dp(8))
 
-        top = BoxLayout(size_hint_y=None, height=dp(70), spacing=dp(8))
+        machine_banner = BoxLayout(size_hint_y=None, height=dp(34), spacing=dp(7))
+        machine_banner.add_widget(lbl(f"▶ {machine_display(self.selected_machine())}", C_BLUE, sp(15), dp(32), True))
+        machine_banner.add_widget(lbl("TELA ATIVA · confira a máquina antes de apontar", C_YELLOW, sp(9), dp(30), True))
+        c.add_widget(machine_banner)
+
+        top = BoxLayout(size_hint_y=None, height=dp(66), spacing=dp(8))
         info = BoxLayout(orientation="vertical")
         is_unplanned_title = bool(o.get("is_unplanned")) or str(o.get("execution_source") or "").upper() == "FORA_PROGRAMACAO"
         title_text = "FORA DA PROGRAMAÇÃO" if is_unplanned_title else f'OP {o.get("op", "")}'
@@ -1483,7 +1726,7 @@ class OperationScreen(Screen):
             try:
                 app = App.get_running_app()
                 res = app.api.start_unplanned(
-                    code, app.machine, self.operator.text.strip(), justification,
+                    code, self.selected_machine(), self.operator.text.strip(), justification,
                     setup.text == "COM SETUP", app.device_id,
                     start_at=start_at, overtime=is_overtime_window(check_dt),
                 )
@@ -1701,7 +1944,7 @@ class OperationScreen(Screen):
                 app = App.get_running_app()
                 res = app.api.start(
                     order["operation_id"],
-                    app.machine,
+                    self.selected_machine(),
                     self.operator.text.strip(),
                     setup.text == "COM SETUP",
                     app.device_id,
@@ -1997,38 +2240,45 @@ class OperationScreen(Screen):
 
     def check_shift_boundary(self, *_):
         if not is_overtime_window():
-            self.shift_prompt_exec_id = None
+            self.shift_prompt_exec_ids = {}
+            return
+        if self.shift_popup is not None:
             return
 
-        order = self.active_order()
-        if not order:
+        for machine in self.configured_machines():
+            state = self._state(machine)
+            order = self._active_from_orders(state.get("orders", []))
+            if not order:
+                continue
+            exec_id = order.get("active_execution_id")
+            if not exec_id or order.get("active_hora_extra"):
+                continue
+            s = str(order.get("status", "")).upper()
+            already = self.shift_prompt_exec_ids.get(machine)
+
+            if s in ("EM_SETUP", "EM SETUP"):
+                if already != exec_id:
+                    self.shift_prompt_exec_ids[machine] = exec_id
+                    self.switch_machine(machine, refresh=False)
+                    self.popup(
+                        f"{machine_display(machine)} · 01:20 · FIM DO T2",
+                        "A ordem ainda está em SETUP. Finalize o setup antes de seguir em hora extra.",
+                    )
+                return
+
+            if s not in ("EM_PRODUCAO", "EM PRODUCAO", "PAUSADA"):
+                continue
+            if already == exec_id:
+                continue
+
+            self.shift_prompt_exec_ids[machine] = exec_id
+            self.switch_machine(machine, refresh=False)
+            self.open_shift_choice(order, machine)
             return
 
-        exec_id = order.get("active_execution_id")
-        if not exec_id or order.get("active_hora_extra"):
-            return
-
-        s = self.status_upper(order)
-        if s in ("EM_SETUP", "EM SETUP"):
-            if self.shift_prompt_exec_id != exec_id:
-                self.shift_prompt_exec_id = exec_id
-                self.popup(
-                    "01:20 · FIM DO T2",
-                    "A ordem ainda está em SETUP. Finalize o setup antes de seguir em hora extra.",
-                )
-            return
-
-        if s not in ("EM_PRODUCAO", "EM PRODUCAO", "PAUSADA"):
-            return
-
-        if self.shift_prompt_exec_id == exec_id:
-            return
-        self.shift_prompt_exec_id = exec_id
-        self.open_shift_choice(order)
-
-    def open_shift_choice(self, order):
+    def open_shift_choice(self, order, machine=None):
         box = BoxLayout(orientation="vertical", padding=dp(22), spacing=dp(12))
-        box.add_widget(lbl("01:20 · FIM DO TURNO T2", C_YELLOW, sp(23), dp(46), True))
+        box.add_widget(lbl(f"{machine_display(machine or self.selected_machine())} · 01:20 · FIM DO T2", C_YELLOW, sp(21), dp(46), True))
         box.add_widget(lbl(
             f'OP {order.get("op", "")} continua aberta.',
             C_TEXT, sp(15), dp(36), True
@@ -2098,7 +2348,7 @@ class OperationScreen(Screen):
 
         def back_action(*_):
             pop.dismiss()
-            self.shift_prompt_exec_id = None
+            self.shift_prompt_exec_ids.pop(self.selected_machine(), None)
             Clock.schedule_once(lambda *_: self.check_shift_boundary(), .2)
 
         back.bind(on_release=back_action)
@@ -2124,7 +2374,7 @@ class OperationScreen(Screen):
                     f'OP {order.get("op")}: virada 01:20 registrada; hora extra iniciada.'
                 )
                 pop.dismiss()
-                self.shift_prompt_exec_id = new_id
+                self.shift_prompt_exec_ids[self.selected_machine()] = new_id
                 self.refresh_remote()
             except Exception as e:
                 msg.text = str(e)[:240]
@@ -2145,7 +2395,7 @@ class OperationScreen(Screen):
         stack.bind(minimum_height=stack.setter("height"))
 
         try:
-            rows = app.api.history(self.machine.text) or []
+            rows = app.api.history(self.selected_machine()) or []
         except Exception as e:
             rows = []
             stack.add_widget(lbl(f"Falha ao carregar histórico: {e}", C_RED, sp(10), dp(60)))
@@ -2212,14 +2462,13 @@ class ApsSerraTabletApp(App):
                 )
             )
 
-            self.machine = (
-                self.store.data[
-                    "config"
-                ].get(
-                    "machine",
-                    "SER-01",
-                )
-            )
+            cfg_local = self.store.data.get("config", {})
+            self.machine = str(
+                cfg_local.get("selected_machine")
+                or cfg_local.get("machine")
+                or cfg_local.get("machine_1")
+                or "SER-04"
+            ).strip().upper()
 
             self.device_id = (
                 "ANDROID-"
