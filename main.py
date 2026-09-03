@@ -582,6 +582,27 @@ class SupabaseAPI:
     def queue(self, machine):
         return self.rpc("aps_tablet_fila_serra", {"p_maquina": machine})
 
+    def catalog_items(self):
+        return self.rpc("aps_tablet_catalogo_itens")
+
+    def start_unplanned(
+        self, item_code, machine, operator, justification, setup, device_id,
+        start_at=None, overtime=False,
+    ):
+        return self.rpc(
+            "aps_tablet_iniciar_fora_programacao",
+            {
+                "p_codigo_item": item_code,
+                "p_maquina": machine,
+                "p_operador": operator,
+                "p_justificativa": justification,
+                "p_setup": bool(setup),
+                "p_device_id": device_id,
+                "p_inicio_em": start_at,
+                "p_hora_extra": bool(overtime),
+            },
+        )
+
     def start(
         self,
         operation_id,
@@ -777,7 +798,7 @@ def safe_float(value, default=0.0):
 
 
 # ============================================================
-# TELA OPERACIONAL 0.5.1
+# TELA OPERACIONAL 0.5.2
 # ============================================================
 
 class OperationScreen(Screen):
@@ -1103,7 +1124,9 @@ class OperationScreen(Screen):
 
         top = BoxLayout(size_hint_y=None, height=dp(70), spacing=dp(8))
         info = BoxLayout(orientation="vertical")
-        info.add_widget(lbl(f'OP {o.get("op", "")}', C_TEXT, sp(24), dp(36), True))
+        is_unplanned_title = bool(o.get("is_unplanned")) or str(o.get("execution_source") or "").upper() == "FORA_PROGRAMACAO"
+        title_text = "FORA DA PROGRAMAÇÃO" if is_unplanned_title else f'OP {o.get("op", "")}'
+        info.add_widget(lbl(title_text, C_YELLOW if is_unplanned_title else C_TEXT, sp(22 if is_unplanned_title else 24), dp(36), True))
         desc = f'{o.get("item", "")} · {o.get("description", "")}'
         info.add_widget(lbl(desc, C_MUTED, sp(11), dp(28)))
         top.add_widget(info)
@@ -1113,14 +1136,25 @@ class OperationScreen(Screen):
         planned = safe_float(o.get("planned_qty"))
         done = safe_float(o.get("done_qty"))
         saldo = max(0.0, planned - done)
+        is_unplanned = bool(o.get("is_unplanned")) or str(o.get("execution_source") or "").upper() == "FORA_PROGRAMACAO"
 
         metrics = GridLayout(cols=4, size_hint_y=None, height=dp(70), spacing=dp(7))
-        metrics.add_widget(self.cell("SEQUÊNCIA", f'{int(o.get("seq", 0) or 0):02d}', C_BLUE))
-        metrics.add_widget(self.cell("PROGRAMADO", f"{planned:g} pç"))
-        metrics.add_widget(self.cell("REALIZADO", f"{done:g} pç", C_GREEN))
-        metrics.add_widget(self.cell("SALDO", f"{saldo:g} pç", C_YELLOW if saldo else C_GREEN))
-        c.add_widget(metrics)
-        c.add_widget(Progress(value=100 * done / max(1, planned)))
+        if is_unplanned:
+            metrics.add_widget(self.cell("ORIGEM", "FORA DO PLANO", C_YELLOW))
+            metrics.add_widget(self.cell("ITEM", str(o.get("item", "")), C_BLUE))
+            metrics.add_widget(self.cell("STATUS", str(o.get("status", "")), C_TEXT))
+            metrics.add_widget(self.cell("REGISTRO", "JUSTIFICADO", C_GREEN))
+            c.add_widget(metrics)
+            reason_text = str(o.get("unplanned_reason") or o.get("active_motivo_fora_fila") or "")
+            if reason_text:
+                c.add_widget(lbl(f"JUSTIFICATIVA: {reason_text}", C_YELLOW, sp(9), dp(30), True))
+        else:
+            metrics.add_widget(self.cell("SEQUÊNCIA", f'{int(o.get("seq", 0) or 0):02d}', C_BLUE))
+            metrics.add_widget(self.cell("PROGRAMADO", f"{planned:g} pç"))
+            metrics.add_widget(self.cell("REALIZADO", f"{done:g} pç", C_GREEN))
+            metrics.add_widget(self.cell("SALDO", f"{saldo:g} pç", C_YELLOW if saldo else C_GREEN))
+            c.add_widget(metrics)
+            c.add_widget(Progress(value=100 * done / max(1, planned)))
 
         exec_meta = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(7))
         active_start = hhmm(o.get("active_inicio_em")) if o.get("active_execution_id") else "--:--"
@@ -1150,7 +1184,7 @@ class OperationScreen(Screen):
             partial.bind(on_release=lambda *_: self.open_quantity_dialog(o, "PARCIAL"))
             pause = FlatButton("PAUSAR", bg=C_DARK, height=dp(56))
             pause.bind(on_release=lambda *_: self.command("pause", o))
-            finish = FlatButton("CONCLUIR OP", bg=C_GREEN, height=dp(56))
+            finish = FlatButton("FINALIZAR PEÇA" if is_unplanned else "CONCLUIR OP", bg=C_GREEN, height=dp(56))
             finish.bind(on_release=lambda *_: self.open_quantity_dialog(o, "CONCLUSAO"))
             actions.add_widget(partial)
             actions.add_widget(pause)
@@ -1161,7 +1195,7 @@ class OperationScreen(Screen):
             partial.bind(on_release=lambda *_: self.open_quantity_dialog(o, "PARCIAL"))
             resume = FlatButton("RETOMAR", bg=C_YELLOW, fg=(.04, .05, .07, 1), height=dp(56))
             resume.bind(on_release=lambda *_: self.command("resume", o))
-            finish = FlatButton("CONCLUIR OP", bg=C_GREEN, height=dp(56))
+            finish = FlatButton("FINALIZAR PEÇA" if is_unplanned else "CONCLUIR OP", bg=C_GREEN, height=dp(56))
             finish.bind(on_release=lambda *_: self.open_quantity_dialog(o, "CONCLUSAO"))
             actions.add_widget(partial)
             actions.add_widget(resume)
@@ -1172,7 +1206,16 @@ class OperationScreen(Screen):
 
     def render_queue_side(self, side):
         side.add_widget(lbl("PRÓXIMOS DA FILA", C_TEXT, sp(13), dp(30), True))
-        side.add_widget(lbl("Toque em ESCOLHER para mudar a sequência.", C_MUTED, sp(9), dp(28)))
+        side.add_widget(lbl("Toque em ESCOLHER para mudar a sequência.", C_MUTED, sp(9), dp(24)))
+
+        outside = FlatButton(
+            "＋ FORA DA PROGRAMAÇÃO",
+            bg=C_YELLOW,
+            fg=(.04, .05, .07, 1),
+            height=dp(38),
+        )
+        outside.bind(on_release=lambda *_: self.open_unplanned_catalog())
+        side.add_widget(outside)
 
         current = self.current()
         current_id = current.get("operation_id") if current else None
@@ -1221,6 +1264,237 @@ class OperationScreen(Screen):
     # --------------------------------------------------------
     # INICIAR / TROCAR FILA
     # --------------------------------------------------------
+
+    def open_unplanned_catalog(self):
+        if not self.operator_ok():
+            return
+
+        app = App.get_running_app()
+        try:
+            items = app.api.catalog_items() or []
+        except Exception as e:
+            self.popup("ERRO NO CADASTRO", f"Não foi possível carregar os itens do Supabase.\n\n{e}")
+            return
+
+        if not items:
+            self.popup("CADASTRO VAZIO", "Nenhum item ativo foi encontrado em aps_itens_serra.")
+            return
+
+        box = BoxLayout(orientation="vertical", padding=dp(14), spacing=dp(7))
+        box.add_widget(lbl("PEÇA FORA DA PROGRAMAÇÃO", C_YELLOW, sp(20), dp(38), True))
+        box.add_widget(lbl(
+            "Escolha uma peça do cadastro oficial. Esta ação NÃO altera o plano congelado.",
+            C_MUTED, sp(10), dp(36)
+        ))
+        search = Field(hint_text="Pesquisar código ou descrição")
+        box.add_widget(search)
+
+        sc = ScrollView(do_scroll_x=False)
+        stack = GridLayout(cols=1, spacing=dp(5), size_hint_y=None)
+        stack.bind(minimum_height=stack.setter("height"))
+        sc.add_widget(stack)
+        box.add_widget(sc)
+
+        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        close = FlatButton("CANCELAR")
+        row.add_widget(close)
+        box.add_widget(row)
+        pop = Popup(title="", content=box, size_hint=(.90, .92), separator_height=0)
+        close.bind(on_release=lambda *_: pop.dismiss())
+
+        normalized = []
+        for item in items:
+            code = str(item.get("codigo_item") or "").strip()
+            if not code:
+                continue
+            desc = str(item.get("descricao") or "").strip()
+            profile = str(item.get("tipo_perfil") or "").strip()
+            normalized.append((code, desc, profile, item))
+
+        def rebuild(*_):
+            term = search.text.strip().upper()
+            stack.clear_widgets()
+            shown = 0
+            for code, desc, profile, item in normalized:
+                hay = f"{code} {desc} {profile}".upper()
+                if term and term not in hay:
+                    continue
+                card = Card(
+                    orientation="vertical", size_hint_y=None, height=dp(72),
+                    padding=[dp(9), dp(5)], spacing=dp(1), radius=dp(9),
+                    bg_color=(.045, .085, .135, 1),
+                )
+                btn = FlatButton(f"{code} · {desc[:48]}", bg=C_DARK, height=dp(38))
+                btn.bind(on_release=lambda *_a, it=item: choose(it))
+                card.add_widget(btn)
+                if profile:
+                    card.add_widget(lbl(f"Perfil: {profile}", C_MUTED, sp(8), dp(20)))
+                stack.add_widget(card)
+                shown += 1
+                if shown >= 80:
+                    break
+            if shown == 0:
+                stack.add_widget(lbl("Nenhum item encontrado.", C_MUTED, sp(11), dp(52)))
+
+        def choose(item):
+            pop.dismiss()
+            self.open_unplanned_reason(item)
+
+        search.bind(text=rebuild)
+        rebuild()
+        pop.open()
+
+    def open_unplanned_reason(self, item):
+        code = str(item.get("codigo_item") or "").strip()
+        desc = str(item.get("descricao") or "").strip()
+
+        box = BoxLayout(orientation="vertical", padding=dp(18), spacing=dp(8))
+        box.add_widget(lbl("JUSTIFICATIVA OBRIGATÓRIA", C_TEXT, sp(20), dp(38), True))
+        box.add_widget(lbl(f"{code} · {desc}", C_BLUE, sp(11), dp(38), True))
+
+        reason = Spinner(
+            text="SELECIONE O MOTIVO",
+            values=(
+                "SEM PROGRAMAÇÃO PCP",
+                "URGÊNCIA DE PRODUÇÃO",
+                "SOLICITAÇÃO PCP",
+                "RETRABALHO",
+                "FALTA NA PROGRAMAÇÃO",
+                "TESTE / AMOSTRA",
+                "OUTRO",
+            ),
+            background_normal="", background_color=C_DARK, color=C_TEXT,
+            size_hint_y=None, height=dp(46),
+        )
+        detail = Field(hint_text="Explique por que esta peça será produzida fora da programação")
+        box.add_widget(reason)
+        box.add_widget(detail)
+        box.add_widget(lbl(
+            "A justificativa ficará gravada no histórico da execução e não modifica a programação do PCP.",
+            C_YELLOW, sp(9), dp(42), True
+        ))
+        msg = lbl("", C_RED, sp(9), dp(22), True)
+        box.add_widget(msg)
+        row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(8))
+        back = FlatButton("VOLTAR")
+        go = FlatButton("CONTINUAR", bg=C_BLUE)
+        row.add_widget(back); row.add_widget(go); box.add_widget(row)
+        pop = Popup(title="", content=box, size_hint=(.80, .72), separator_height=0)
+        back.bind(on_release=lambda *_: pop.dismiss())
+
+        def confirm(*_):
+            category = reason.text.strip()
+            detail_text = detail.text.strip()
+            if category == "SELECIONE O MOTIVO":
+                msg.text = "Selecione o motivo."
+                return
+            if len(detail_text) < 3:
+                msg.text = "Descreva a justificativa."
+                return
+            justification = f"{category} · {detail_text}"
+            pop.dismiss()
+
+            active = self.active_order()
+            if active:
+                self.open_quantity_dialog(
+                    active,
+                    "TROCA_FILA",
+                    after_success=lambda: self.open_unplanned_start_dialog(item, justification),
+                    note_prefix=f"Troca para peça fora da programação: {justification}",
+                )
+            else:
+                self.open_unplanned_start_dialog(item, justification)
+
+        go.bind(on_release=confirm)
+        pop.open()
+
+    def open_unplanned_start_dialog(self, item, justification):
+        if self.active_order():
+            self.popup(
+                "EXECUÇÃO ATIVA",
+                "Ainda existe uma execução ativa. Faça o apontamento parcial antes de iniciar a peça fora da programação.",
+            )
+            return
+
+        code = str(item.get("codigo_item") or "").strip()
+        desc = str(item.get("descricao") or "").strip()
+        box = BoxLayout(orientation="vertical", padding=dp(17), spacing=dp(7))
+        box.add_widget(lbl("INICIAR FORA DA PROGRAMAÇÃO", C_YELLOW, sp(19), dp(38), True))
+        box.add_widget(lbl(f"{code} · {desc}", C_TEXT, sp(11), dp(34), True))
+        box.add_widget(lbl(f"Motivo: {justification}", C_MUTED, sp(9), dp(42)))
+
+        setup = Spinner(
+            text="SEM SETUP", values=("SEM SETUP", "COM SETUP"),
+            background_normal="", background_color=C_DARK, color=C_TEXT,
+            size_hint_y=None, height=dp(44),
+        )
+        box.add_widget(lbl("SETUP", C_MUTED, sp(9), dp(18), True)); box.add_widget(setup)
+
+        mode = Spinner(
+            text="AGORA", values=("AGORA", "MANUAL"),
+            background_normal="", background_color=C_DARK, color=C_TEXT,
+            size_hint_y=None, height=dp(44),
+        )
+        box.add_widget(lbl("HORA DE INÍCIO", C_MUTED, sp(9), dp(18), True)); box.add_widget(mode)
+
+        dtrow = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(7))
+        now = br_now()
+        date_field = Field(text=now.strftime("%d/%m/%Y"), hint_text="DD/MM/AAAA")
+        time_field = Field(text=now.strftime("%H:%M"), hint_text="HH:MM")
+        date_field.disabled = True; time_field.disabled = True
+        dtrow.add_widget(date_field); dtrow.add_widget(time_field); box.add_widget(dtrow)
+        shift_preview = lbl("", C_YELLOW, sp(10), dp(28), True); box.add_widget(shift_preview)
+
+        def update_preview(*_):
+            try:
+                dt = br_now() if mode.text == "AGORA" else parse_manual_datetime(date_field.text, time_field.text)
+                sh, window = shift_info(dt)
+                shift_preview.text = f"TURNO DESTA EXECUÇÃO: {sh} · {window}"
+            except Exception:
+                shift_preview.text = "TURNO: revise a data/hora informada"
+
+        def mode_changed(_sp, value):
+            manual = value == "MANUAL"
+            date_field.disabled = not manual; time_field.disabled = not manual
+            update_preview()
+        mode.bind(text=mode_changed); date_field.bind(text=update_preview); time_field.bind(text=update_preview)
+        update_preview()
+
+        msg = lbl("", C_RED, sp(9), dp(22), True); box.add_widget(msg)
+        row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(8))
+        back = FlatButton("VOLTAR"); start = FlatButton("INICIAR", bg=C_GREEN)
+        row.add_widget(back); row.add_widget(start); box.add_widget(row)
+        pop = Popup(title="", content=box, size_hint=(.82, .88), separator_height=0)
+        back.bind(on_release=lambda *_: pop.dismiss())
+
+        def confirm(*_):
+            start_at = None
+            check_dt = br_now()
+            if mode.text == "MANUAL":
+                try:
+                    manual_dt = parse_manual_datetime(date_field.text, time_field.text)
+                except Exception:
+                    msg.text = "Data/hora inválida. Use DD/MM/AAAA e HH:MM."
+                    return
+                if manual_dt > br_now() + timedelta(minutes=5):
+                    msg.text = "A hora de início não pode estar no futuro."
+                    return
+                start_at = manual_dt.isoformat(); check_dt = manual_dt
+            try:
+                app = App.get_running_app()
+                res = app.api.start_unplanned(
+                    code, app.machine, self.operator.text.strip(), justification,
+                    setup.text == "COM SETUP", app.device_id,
+                    start_at=start_at, overtime=is_overtime_window(check_dt),
+                )
+                app.online = True
+                app.store.event(f"FORA DA PROGRAMAÇÃO · {code} · {justification}")
+                pop.dismiss(); self.refresh_remote()
+            except Exception as e:
+                msg.text = str(e)[:240]
+
+        start.bind(on_release=confirm)
+        pop.open()
 
     def select_queue_order(self, order):
         if not self.operator_ok():
@@ -1466,20 +1740,26 @@ class OperationScreen(Screen):
             "TROCA_FILA": "APONTAR ANTES DE TROCAR",
             "VIRADA_TURNO": "FINALIZAR TAREFA / TURNO",
         }
-        title = titles.get(kind, "APONTAMENTO")
+        is_unplanned = bool(order.get("is_unplanned")) or str(order.get("execution_source") or "").upper() == "FORA_PROGRAMACAO"
+        if is_unplanned and kind == "CONCLUSAO":
+            title = "FINALIZAR PEÇA FORA DA PROGRAMAÇÃO"
+        else:
+            title = titles.get(kind, "APONTAMENTO")
 
         box = BoxLayout(orientation="vertical", padding=dp(15), spacing=dp(6))
         box.add_widget(lbl(title, C_TEXT, sp(20), dp(36), True))
-        box.add_widget(lbl(
-            f'OP {order.get("op", "")} · saldo atual {balance:g} pç',
-            C_MUTED, sp(10), dp(28)
-        ))
+        subtitle = (
+            f'ITEM {order.get("item", "")} · execução fora da programação'
+            if is_unplanned
+            else f'OP {order.get("op", "")} · saldo atual {balance:g} pç'
+        )
+        box.add_widget(lbl(subtitle, C_MUTED, sp(10), dp(28)))
 
         g = GridLayout(cols=2, size_hint_y=None, height=dp(90), spacing=dp(7))
         a = BoxLayout(orientation="vertical")
         b = BoxLayout(orientation="vertical")
         a.add_widget(lbl("QUANTIDADE BOA", C_MUTED, sp(9), dp(19), True))
-        default_qty = f"{balance:g}" if kind == "CONCLUSAO" else ""
+        default_qty = f"{balance:g}" if kind == "CONCLUSAO" and not is_unplanned else ""
         qty = Field(text=default_qty, hint_text="Quantidade", input_filter="float")
         a.add_widget(qty)
         b.add_widget(lbl("REFUGO", C_MUTED, sp(9), dp(19), True))
@@ -1539,16 +1819,21 @@ class OperationScreen(Screen):
         box.add_widget(note)
 
         if kind == "PARCIAL":
-            box.add_widget(lbl(
+            partial_help = (
+                "CONTINUAR: salva este trecho e abre uma nova execução da mesma peça. "
+                "IR PARA OUTRA: encerra este trecho avulso e volta à programação."
+                if is_unplanned else
                 "CONTINUAR: salva este trecho e abre uma nova execução a partir do horário de fim. "
-                "IR PARA OUTRA: encerra o trecho e deixa a OP PARCIAL na fila.",
-                C_YELLOW, sp(9), dp(48), True
-            ))
+                "IR PARA OUTRA: encerra o trecho e deixa a OP PARCIAL na fila."
+            )
+            box.add_widget(lbl(partial_help, C_YELLOW, sp(9), dp(48), True))
         elif kind in ("TROCA_FILA", "VIRADA_TURNO"):
-            box.add_widget(lbl(
-                "A ordem continuará na fila como PARCIAL se ainda existir saldo.",
-                C_YELLOW, sp(9), dp(30), True
-            ))
+            helper = (
+                "Este trecho fora da programação será encerrado antes da troca."
+                if is_unplanned else
+                "A ordem continuará na fila como PARCIAL se ainda existir saldo."
+            )
+            box.add_widget(lbl(helper, C_YELLOW, sp(9), dp(30), True))
 
         msg = lbl("", C_RED, sp(9), dp(22), True)
         box.add_widget(msg)
@@ -1575,7 +1860,13 @@ class OperationScreen(Screen):
 
             end_at = None
             end_dt = br_now()
-            if end_mode.text == "MANUAL":
+
+            # Quando o alerta de fim do T2 aparece depois de 01:20,
+            # o trecho normal deve ser encerrado exatamente às 01:20.
+            if kind == "VIRADA_TURNO" and is_overtime_window():
+                end_dt = br_now().replace(hour=1, minute=20, second=0, microsecond=0)
+                end_at = end_dt.isoformat()
+            elif end_mode.text == "MANUAL":
                 try:
                     end_dt = parse_manual_datetime(end_date.text, end_time.text)
                 except Exception:
@@ -1865,7 +2156,9 @@ class OperationScreen(Screen):
             turno = e.get("turno") or "-"
             extra = " · HE" if e.get("hora_extra") else ""
             qty = safe_float(e.get("quantidade_boa"))
-            text = f'{start}–{end} · {turno}{extra} · OP {e.get("op", "")} · {qty:g} pç · {e.get("operador", "")}'
+            is_unplanned = str(e.get("origem_execucao") or "").upper() == "FORA_PROGRAMACAO"
+            ref = f'AVULSA · {e.get("codigo_item", "")}' if is_unplanned else f'OP {e.get("op", "")}'
+            text = f'{start}–{end} · {turno}{extra} · {ref} · {qty:g} pç · {e.get("operador", "")}'
             card = Card(orientation="vertical", size_hint_y=None, height=dp(58), padding=[dp(9), dp(5)])
             card.add_widget(lbl(text, C_TEXT, sp(10), dp(28), True))
             if e.get("motivo_fora_fila"):
