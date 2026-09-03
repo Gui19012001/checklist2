@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import ssl
+import re
 import threading
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -617,7 +618,16 @@ class SupabaseAPI:
     def resume(self, execution_id):
         return self.rpc("aps_tablet_retomar", {"p_execucao_id": execution_id})
 
-    def finish(self, execution_id, good, scrap, note, kind="PARCIAL"):
+    def finish(
+        self,
+        execution_id,
+        good,
+        scrap,
+        note,
+        kind="PARCIAL",
+        end_at=None,
+        next_action=None,
+    ):
         return self.rpc(
             "aps_tablet_finalizar_execucao_v2",
             {
@@ -626,6 +636,20 @@ class SupabaseAPI:
                 "p_quantidade_refugo": float(scrap),
                 "p_observacao": note or "",
                 "p_tipo": kind,
+                "p_fim_em": end_at,
+                "p_proximo_passo": next_action,
+            },
+        )
+
+    def partial_continue(self, execution_id, good, scrap, note, end_at=None):
+        return self.rpc(
+            "aps_tablet_parcial_continuar",
+            {
+                "p_execucao_id": execution_id,
+                "p_quantidade_boa": float(good),
+                "p_quantidade_refugo": float(scrap),
+                "p_observacao": note or "",
+                "p_fim_em": end_at,
             },
         )
 
@@ -694,6 +718,57 @@ def parse_manual_datetime(date_text, time_text):
     return dt.replace(tzinfo=BR_TZ)
 
 
+def parse_iso_datetime(value):
+    if not value:
+        return None
+    dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=BR_TZ)
+    return dt.astimezone(BR_TZ)
+
+
+def compact_order_ref(value):
+    """Compacta referências sintéticas como ITEM|2026-S35|2026-09-03|P100."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "SEM REFERÊNCIA"
+
+    parts = [p.strip() for p in raw.split("|") if p.strip()]
+    if len(parts) >= 2:
+        week = next(
+            (p.upper() for p in parts if re.fullmatch(r"\d{4}-S\d{1,2}", p.upper())),
+            None,
+        )
+        date_part = next(
+            (p for p in parts if re.fullmatch(r"\d{4}-\d{2}-\d{2}", p)),
+            None,
+        )
+        labels = []
+        if week:
+            labels.append(week.split("-", 1)[1])
+        if date_part:
+            try:
+                labels.append(datetime.strptime(date_part, "%Y-%m-%d").strftime("%d/%m/%Y"))
+            except Exception:
+                labels.append(date_part)
+        if labels:
+            return " · ".join(labels)
+
+    return f"OP {raw}"
+
+
+def compact_plan_ref(plan):
+    if not isinstance(plan, dict):
+        return "Programação congelada"
+    code = str(plan.get("codigo_plano") or "").strip()
+    if not code:
+        return "Programação congelada"
+    compact = compact_order_ref(code)
+    if compact.startswith("OP "):
+        return "Programação congelada"
+    return f"Programação · {compact}"
+
+
 def safe_float(value, default=0.0):
     try:
         return float(value or default)
@@ -702,7 +777,7 @@ def safe_float(value, default=0.0):
 
 
 # ============================================================
-# TELA OPERACIONAL 0.5.0
+# TELA OPERACIONAL 0.5.1
 # ============================================================
 
 class OperationScreen(Screen):
@@ -764,8 +839,7 @@ class OperationScreen(Screen):
         c = Card(orientation="horizontal", padding=[dp(15), dp(7)], spacing=dp(8))
         left = BoxLayout(orientation="vertical", size_hint_x=.55)
         left.add_widget(lbl("APS SERRA · OPERAÇÃO", C_TEXT, sp(20), dp(30), True))
-        plan_code = self.plan.get("codigo_plano") if isinstance(self.plan, dict) else None
-        plan_text = f"Plano {plan_code}" if plan_code else "Programação congelada"
+        plan_text = compact_plan_ref(self.plan)
         left.add_widget(lbl(plan_text, C_MUTED, sp(10), dp(20)))
         c.add_widget(left)
 
@@ -1127,7 +1201,11 @@ class OperationScreen(Screen):
                 bg_color=(.045, .085, .135, 1),
             )
             row1 = BoxLayout(size_hint_y=None, height=dp(27))
-            row1.add_widget(lbl(f'#{int(o.get("seq", 0) or 0):02d} · OP {o.get("op", "")}', C_TEXT, sp(10), dp(25), True))
+            queue_ref = compact_order_ref(o.get("op", ""))
+            row1.add_widget(lbl(
+                f'#{int(o.get("seq", 0) or 0):02d} · {queue_ref}',
+                C_TEXT, sp(10), dp(25), True
+            ))
             row1.add_widget(Status(str(o.get("status", "")), self.tone(o.get("status"))))
             card.add_widget(row1)
             card.add_widget(lbl(str(o.get("item", "")), C_BLUE, sp(10), dp(22), True))
@@ -1273,12 +1351,33 @@ class OperationScreen(Screen):
         dtrow.add_widget(time_field)
         box.add_widget(dtrow)
 
+        shift_preview = lbl("", C_YELLOW, sp(10), dp(28), True)
+        box.add_widget(shift_preview)
+
+        def update_shift_preview(*_):
+            try:
+                preview_dt = (
+                    br_now()
+                    if mode.text == "AGORA"
+                    else parse_manual_datetime(date_field.text, time_field.text)
+                )
+                preview_shift, preview_window = shift_info(preview_dt)
+                shift_preview.text = (
+                    f"TURNO DESTA EXECUÇÃO: {preview_shift} · {preview_window}"
+                )
+            except Exception:
+                shift_preview.text = "TURNO: revise a data/hora informada"
+
         def mode_changed(_spinner, value):
             manual = value == "MANUAL"
             date_field.disabled = not manual
             time_field.disabled = not manual
+            update_shift_preview()
 
         mode.bind(text=mode_changed)
+        date_field.bind(text=update_shift_preview)
+        time_field.bind(text=update_shift_preview)
+        update_shift_preview()
 
         reason = detail = None
         if forced_reason:
@@ -1369,47 +1468,97 @@ class OperationScreen(Screen):
         }
         title = titles.get(kind, "APONTAMENTO")
 
-        box = BoxLayout(orientation="vertical", padding=dp(17), spacing=dp(7))
-        box.add_widget(lbl(title, C_TEXT, sp(20), dp(38), True))
+        box = BoxLayout(orientation="vertical", padding=dp(15), spacing=dp(6))
+        box.add_widget(lbl(title, C_TEXT, sp(20), dp(36), True))
         box.add_widget(lbl(
             f'OP {order.get("op", "")} · saldo atual {balance:g} pç',
-            C_MUTED, sp(11), dp(30)
+            C_MUTED, sp(10), dp(28)
         ))
 
-        g = GridLayout(cols=2, size_hint_y=None, height=dp(94), spacing=dp(7))
+        g = GridLayout(cols=2, size_hint_y=None, height=dp(90), spacing=dp(7))
         a = BoxLayout(orientation="vertical")
         b = BoxLayout(orientation="vertical")
-        a.add_widget(lbl("QUANTIDADE BOA", C_MUTED, sp(9), dp(20), True))
+        a.add_widget(lbl("QUANTIDADE BOA", C_MUTED, sp(9), dp(19), True))
         default_qty = f"{balance:g}" if kind == "CONCLUSAO" else ""
         qty = Field(text=default_qty, hint_text="Quantidade", input_filter="float")
         a.add_widget(qty)
-        b.add_widget(lbl("REFUGO", C_MUTED, sp(9), dp(20), True))
+        b.add_widget(lbl("REFUGO", C_MUTED, sp(9), dp(19), True))
         scrap = Field(text="0", input_filter="float")
         b.add_widget(scrap)
         g.add_widget(a)
         g.add_widget(b)
         box.add_widget(g)
 
+        # O fim pertence a ESTA execução, e não à OP inteira.
+        end_mode = Spinner(
+            text="AGORA",
+            values=("AGORA", "MANUAL"),
+            background_normal="",
+            background_color=C_DARK,
+            color=C_TEXT,
+            size_hint_y=None,
+            height=dp(42),
+        )
+        box.add_widget(lbl("HORA DE FIM DESTE TRECHO", C_MUTED, sp(9), dp(18), True))
+        box.add_widget(end_mode)
+
+        end_row = BoxLayout(size_hint_y=None, height=dp(45), spacing=dp(7))
+        now = br_now()
+        end_date = Field(text=now.strftime("%d/%m/%Y"), hint_text="DD/MM/AAAA")
+        end_time = Field(text=now.strftime("%H:%M"), hint_text="HH:MM")
+        end_date.disabled = True
+        end_time.disabled = True
+        end_row.add_widget(end_date)
+        end_row.add_widget(end_time)
+        box.add_widget(end_row)
+
+        def end_mode_changed(_spinner, value):
+            manual = value == "MANUAL"
+            end_date.disabled = not manual
+            end_time.disabled = not manual
+
+        end_mode.bind(text=end_mode_changed)
+
+        partial_action = None
+        if kind == "PARCIAL":
+            box.add_widget(lbl("APÓS ESTE APONTAMENTO", C_MUTED, sp(9), dp(18), True))
+            partial_action = Spinner(
+                text="CONTINUAR NESTA PEÇA",
+                values=("CONTINUAR NESTA PEÇA", "IR PARA OUTRA PEÇA"),
+                background_normal="",
+                background_color=C_DARK,
+                color=C_TEXT,
+                size_hint_y=None,
+                height=dp(42),
+            )
+            box.add_widget(partial_action)
+
         note = Field(hint_text="Observação opcional")
         if note_prefix:
             note.text = note_prefix
         box.add_widget(note)
 
-        if kind in ("PARCIAL", "TROCA_FILA", "VIRADA_TURNO"):
+        if kind == "PARCIAL":
+            box.add_widget(lbl(
+                "CONTINUAR: salva este trecho e abre uma nova execução a partir do horário de fim. "
+                "IR PARA OUTRA: encerra o trecho e deixa a OP PARCIAL na fila.",
+                C_YELLOW, sp(9), dp(48), True
+            ))
+        elif kind in ("TROCA_FILA", "VIRADA_TURNO"):
             box.add_widget(lbl(
                 "A ordem continuará na fila como PARCIAL se ainda existir saldo.",
-                C_YELLOW, sp(10), dp(35), True
+                C_YELLOW, sp(9), dp(30), True
             ))
 
-        msg = lbl("", C_RED, sp(10), dp(24), True)
+        msg = lbl("", C_RED, sp(9), dp(22), True)
         box.add_widget(msg)
-        row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+        row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(8))
         back = FlatButton("VOLTAR")
         ok = FlatButton("CONFIRMAR", bg=C_GREEN)
         row.add_widget(back)
         row.add_widget(ok)
         box.add_widget(row)
-        pop = Popup(title="", content=box, size_hint=(.76, .78), separator_height=0)
+        pop = Popup(title="", content=box, size_hint=(.78, .94), separator_height=0)
         back.bind(on_release=lambda *_: pop.dismiss())
 
         def confirm(*_):
@@ -1419,25 +1568,121 @@ class OperationScreen(Screen):
             except Exception:
                 msg.text = "Quantidades inválidas."
                 return
+
             if q <= 0 or r < 0:
                 msg.text = "Quantidade boa deve ser maior que zero e refugo não pode ser negativo."
                 return
+
+            end_at = None
+            end_dt = br_now()
+            if end_mode.text == "MANUAL":
+                try:
+                    end_dt = parse_manual_datetime(end_date.text, end_time.text)
+                except Exception:
+                    msg.text = "Fim inválido. Use DD/MM/AAAA e HH:MM."
+                    return
+
+                if end_dt > br_now() + timedelta(minutes=5):
+                    msg.text = "A hora de fim não pode estar no futuro."
+                    return
+                end_at = end_dt.isoformat()
+
+            active_start = parse_iso_datetime(order.get("active_inicio_em"))
+            if active_start and end_dt < active_start:
+                msg.text = (
+                    f"O fim não pode ser anterior ao início desta execução "
+                    f"({active_start:%d/%m %H:%M})."
+                )
+                return
+
+            if kind == "PARCIAL":
+                next_action = (
+                    "CONTINUAR"
+                    if partial_action.text == "CONTINUAR NESTA PEÇA"
+                    else "TROCAR_PECA"
+                )
+            elif kind == "TROCA_FILA":
+                next_action = "TROCAR_PECA"
+            elif kind == "CONCLUSAO":
+                next_action = "CONCLUIR"
+            else:
+                next_action = "ENCERRAR"
+
             try:
                 app = App.get_running_app()
-                res = app.api.finish(exec_id, q, r, note.text.strip(), kind=kind)
-                order_status = (res or {}).get("order_status", "") if isinstance(res, dict) else ""
-                app.store.event(f'OP {order.get("op")}: {q:g} pç lançadas · {kind}.')
+
+                # CONTINUAR é atômico no Supabase:
+                # fecha este período e cria outra execução da mesma OP
+                # começando exatamente no fim informado.
+                if kind == "PARCIAL" and next_action == "CONTINUAR":
+                    res = app.api.partial_continue(
+                        exec_id,
+                        q,
+                        r,
+                        note.text.strip(),
+                        end_at=end_at,
+                    )
+                    order_status = (
+                        (res or {}).get("order_status", "")
+                        if isinstance(res, dict)
+                        else ""
+                    )
+                    app.store.event(
+                        f'OP {order.get("op")}: {q:g} pç parciais · continuidade aberta.'
+                    )
+                    pop.dismiss()
+                    self.refresh_remote()
+                    Clock.schedule_once(
+                        lambda *_: self.popup(
+                            "PARCIAL SALVO",
+                            "Este trecho foi encerrado e uma nova execução da mesma peça foi iniciada "
+                            "a partir do horário de fim informado.",
+                        ),
+                        .35,
+                    )
+                    return
+
+                res = app.api.finish(
+                    exec_id,
+                    q,
+                    r,
+                    note.text.strip(),
+                    kind=kind,
+                    end_at=end_at,
+                    next_action=next_action,
+                )
+                order_status = (
+                    (res or {}).get("order_status", "")
+                    if isinstance(res, dict)
+                    else ""
+                )
+                app.store.event(
+                    f'OP {order.get("op")}: {q:g} pç lançadas · {kind} · {next_action}.'
+                )
                 pop.dismiss()
                 self.refresh_remote()
+
                 if after_success:
                     Clock.schedule_once(lambda *_: after_success(), .65)
+                elif kind == "PARCIAL" and next_action == "TROCAR_PECA":
+                    Clock.schedule_once(
+                        lambda *_: self.popup(
+                            "TRECHO ENCERRADO",
+                            "A OP ficou PARCIAL na fila. Ao ser retomada, uma nova execução deverá "
+                            "informar seu próprio horário de início e fim.",
+                        ),
+                        .35,
+                    )
                 elif order_status:
                     Clock.schedule_once(
-                        lambda *_: self.popup("APONTAMENTO SALVO", f"Situação da ordem: {order_status}"),
+                        lambda *_: self.popup(
+                            "APONTAMENTO SALVO",
+                            f"Situação da ordem: {order_status}",
+                        ),
                         .35,
                     )
             except Exception as e:
-                msg.text = str(e)[:220]
+                msg.text = str(e)[:260]
 
         ok.bind(on_release=confirm)
         pop.open()
