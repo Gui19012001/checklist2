@@ -6,7 +6,7 @@ import sys
 import ssl
 import threading
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -518,41 +518,21 @@ class LocalStore:
 
 class SupabaseAPI:
     def __init__(self, cfg):
-        self.url = (
-            cfg.get(
-                "SUPABASE_URL",
-                "",
-            ).rstrip("/")
-        )
-
-        self.anon = cfg.get(
-            "SUPABASE_ANON_KEY",
-            "",
-        )
+        self.url = cfg.get("SUPABASE_URL", "").rstrip("/")
+        self.anon = cfg.get("SUPABASE_ANON_KEY", "")
 
     @property
     def configured(self):
-        return bool(
-            self.url
-            and self.anon
-        )
+        return bool(self.url and self.anon)
 
-    def rpc(
-        self,
-        name,
-        payload=None,
-        timeout=15,
-    ):
+    def rpc(self, name, payload=None, timeout=20):
         if not self.configured:
             raise RuntimeError(
-                "SUPABASE_URL / SUPABASE_ANON_KEY "
-                "não configurados em tablet.env."
+                "SUPABASE_URL / SUPABASE_ANON_KEY não configurados em tablet.env."
             )
 
         body = json.dumps(
-            dict(payload or {}),
-            ensure_ascii=False,
-            separators=(",", ":"),
+            dict(payload or {}), ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
 
         req = Request(
@@ -560,12 +540,8 @@ class SupabaseAPI:
             data=body,
             headers={
                 "apikey": self.anon,
-                "Authorization": (
-                    f"Bearer {self.anon}"
-                ),
-                "Content-Type": (
-                    "application/json"
-                ),
+                "Authorization": f"Bearer {self.anon}",
+                "Content-Type": "application/json",
                 "Accept": "application/json",
             },
             method="POST",
@@ -573,79 +549,37 @@ class SupabaseAPI:
 
         try:
             ssl_context = None
-
             if self.url.lower().startswith("https://"):
                 if certifi is not None:
-                    ssl_context = ssl.create_default_context(
-                        cafile=certifi.where()
-                    )
+                    ssl_context = ssl.create_default_context(cafile=certifi.where())
                 else:
                     ssl_context = ssl.create_default_context()
 
             if ssl_context is not None:
-                response = urlopen(
-                    req,
-                    timeout=timeout,
-                    context=ssl_context,
-                )
+                response = urlopen(req, timeout=timeout, context=ssl_context)
             else:
-                response = urlopen(
-                    req,
-                    timeout=timeout,
-                )
+                response = urlopen(req, timeout=timeout)
 
             with response as resp:
-                raw = (
-                    resp.read()
-                    .decode("utf-8")
-                )
-
+                raw = resp.read().decode("utf-8")
                 if not raw.strip():
                     return None
-
                 return json.loads(raw)
 
         except HTTPError as exc:
-            raw = exc.read().decode(
-                "utf-8",
-                errors="replace",
-            )
-
-            raise RuntimeError(
-                f"HTTP {exc.code}: "
-                f"{raw[:500]}"
-            ) from exc
-
+            raw = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {exc.code}: {raw[:700]}") from exc
         except URLError as exc:
-            reason = getattr(
-                exc,
-                "reason",
-                exc,
-            )
-
-            raise RuntimeError(
-                "Falha de conexão com "
-                f"o Supabase: {reason}"
-            ) from exc
-
+            reason = getattr(exc, "reason", exc)
+            raise RuntimeError(f"Falha de conexão com o Supabase: {reason}") from exc
         except TimeoutError as exc:
-            raise RuntimeError(
-                "Tempo esgotado ao comunicar "
-                "com o Supabase."
-            ) from exc
+            raise RuntimeError("Tempo esgotado ao comunicar com o Supabase.") from exc
 
     def machines(self):
-        return self.rpc(
-            "aps_tablet_maquinas"
-        )
+        return self.rpc("aps_tablet_maquinas")
 
     def queue(self, machine):
-        return self.rpc(
-            "aps_tablet_fila_serra",
-            {
-                "p_maquina": machine,
-            },
-        )
+        return self.rpc("aps_tablet_fila_serra", {"p_maquina": machine})
 
     def start(
         self,
@@ -654,1603 +588,1063 @@ class SupabaseAPI:
         operator,
         setup,
         device_id,
+        start_at=None,
+        queue_reason=None,
+        overtime=False,
     ):
         return self.rpc(
-            "aps_tablet_iniciar_execucao",
+            "aps_tablet_iniciar_execucao_v2",
             {
-                "p_operacao_id": int(
-                    operation_id
-                ),
+                "p_operacao_id": int(operation_id),
                 "p_maquina": machine,
                 "p_operador": operator,
                 "p_setup": bool(setup),
                 "p_device_id": device_id,
+                "p_inicio_em": start_at,
+                "p_motivo_fora_fila": queue_reason or None,
+                "p_hora_extra": bool(overtime),
             },
         )
 
-    def finish_setup(
-        self,
-        execution_id,
-    ):
+    def finish_setup(self, execution_id):
         return self.rpc(
-            "aps_tablet_finalizar_setup",
+            "aps_tablet_finalizar_setup", {"p_execucao_id": execution_id}
+        )
+
+    def pause(self, execution_id):
+        return self.rpc("aps_tablet_pausar", {"p_execucao_id": execution_id})
+
+    def resume(self, execution_id):
+        return self.rpc("aps_tablet_retomar", {"p_execucao_id": execution_id})
+
+    def finish(self, execution_id, good, scrap, note, kind="PARCIAL"):
+        return self.rpc(
+            "aps_tablet_finalizar_execucao_v2",
             {
-                "p_execucao_id": (
-                    execution_id
-                ),
+                "p_execucao_id": execution_id,
+                "p_quantidade_boa": float(good),
+                "p_quantidade_refugo": float(scrap),
+                "p_observacao": note or "",
+                "p_tipo": kind,
             },
         )
 
-    def pause(
-        self,
-        execution_id,
-    ):
+    def overtime(self, execution_id, good, scrap, note):
         return self.rpc(
-            "aps_tablet_pausar",
+            "aps_tablet_virar_hora_extra",
             {
-                "p_execucao_id": (
-                    execution_id
-                ),
+                "p_execucao_id": execution_id,
+                "p_quantidade_boa": float(good),
+                "p_quantidade_refugo": float(scrap),
+                "p_observacao": note or "",
             },
         )
 
-    def resume(
-        self,
-        execution_id,
-    ):
+    def history(self, machine):
         return self.rpc(
-            "aps_tablet_retomar",
-            {
-                "p_execucao_id": (
-                    execution_id
-                ),
-            },
-        )
-
-    def finish(
-        self,
-        execution_id,
-        good,
-        scrap,
-        note,
-    ):
-        return self.rpc(
-            "aps_tablet_finalizar_execucao",
-            {
-                "p_execucao_id": (
-                    execution_id
-                ),
-                "p_quantidade_boa": float(
-                    good
-                ),
-                "p_quantidade_refugo": float(
-                    scrap
-                ),
-                "p_observacao": (
-                    note or ""
-                ),
-            },
-        )
-
-    def history(
-        self,
-        machine,
-    ):
-        return self.rpc(
-            "aps_tablet_historico",
-            {
-                "p_maquina": machine,
-                "p_limite": 50,
-            },
+            "aps_tablet_historico", {"p_maquina": machine, "p_limite": 80}
         )
 
 
 # ============================================================
-# TELA PRINCIPAL
+# REGRAS DE TURNO
+# ============================================================
+
+BR_TZ = timezone(timedelta(hours=-3))
+T1_START = (6, 0)
+T1_END = (15, 48)
+T2_START = (16, 0)
+T2_END = (1, 20)
+
+
+def br_now():
+    return datetime.now(BR_TZ)
+
+
+def minutes_of_day(dt):
+    return dt.hour * 60 + dt.minute
+
+
+def shift_info(dt=None):
+    dt = dt or br_now()
+    m = minutes_of_day(dt)
+    t1_start = 6 * 60
+    t1_end = 15 * 60 + 48
+    t2_start = 16 * 60
+    t2_end = 1 * 60 + 20
+
+    if t1_start <= m <= t1_end:
+        return "T1", "06:00–15:48"
+    if m >= t2_start or m <= t2_end:
+        return "T2", "16:00–01:20"
+    if t2_end < m < t1_start:
+        return "HORA EXTRA", "após 01:20"
+    return "TRANSIÇÃO", "15:48–16:00"
+
+
+def is_overtime_window(dt=None):
+    dt = dt or br_now()
+    m = minutes_of_day(dt)
+    return (1 * 60 + 20) < m < (6 * 60)
+
+
+def parse_manual_datetime(date_text, time_text):
+    raw = f"{date_text.strip()} {time_text.strip()}"
+    dt = datetime.strptime(raw, "%d/%m/%Y %H:%M")
+    return dt.replace(tzinfo=BR_TZ)
+
+
+def safe_float(value, default=0.0):
+    try:
+        return float(value or default)
+    except Exception:
+        return float(default)
+
+
+# ============================================================
+# TELA OPERACIONAL 0.5.0
 # ============================================================
 
 class OperationScreen(Screen):
+    ACTIVE_STATUSES = {"EM_SETUP", "EM SETUP", "EM_PRODUCAO", "EM PRODUCAO", "PAUSADA"}
+
     def __init__(self, **kw):
         super().__init__(**kw)
-
         self.busy = False
         self.orders = []
-        self.active_execution_id = None
+        self.plan = {}
+        self.shift_prompt_exec_id = None
+        self.shift_popup = None
 
         root = BoxLayout(
             orientation="vertical",
-            padding=[
-                dp(14),
-                dp(10),
-                dp(14),
-                dp(12),
-            ],
-            spacing=dp(9),
+            padding=[dp(12), dp(8), dp(12), dp(10)],
+            spacing=dp(8),
         )
         self.add_widget(root)
 
-        self.header = BoxLayout(
-            size_hint_y=None,
-            height=dp(78),
-        )
+        self.header = BoxLayout(size_hint_y=None, height=dp(64))
         root.add_widget(self.header)
 
         self.identity = Card(
             orientation="horizontal",
             size_hint_y=None,
-            height=dp(72),
-            padding=[
-                dp(12),
-                dp(9),
-            ],
+            height=dp(66),
+            padding=[dp(12), dp(7)],
             spacing=dp(8),
         )
         root.add_widget(self.identity)
 
-        self.nav = BoxLayout(
-            size_hint_y=None,
-            height=dp(46),
-            spacing=dp(8),
-        )
-        root.add_widget(self.nav)
+        self.body = BoxLayout(orientation="horizontal", spacing=dp(9))
+        root.add_widget(self.body)
 
-        self.content = BoxLayout(
-            orientation="vertical"
-        )
-        root.add_widget(self.content)
+        self.footer = BoxLayout(size_hint_y=None, height=dp(28))
+        root.add_widget(self.footer)
 
         self.build_identity()
-        self.build_nav()
+        self.render_header()
+        self.render_footer()
+
+        Clock.schedule_interval(self._tick, 1.0)
+        Clock.schedule_interval(self.check_shift_boundary, 20.0)
 
     def on_pre_enter(self, *_):
-        self.render_header()
         self.load_cached()
+        Clock.schedule_once(lambda *_: self.refresh_remote(), .35)
+        Clock.schedule_once(lambda *_: self.check_shift_boundary(), 1.5)
 
-        Clock.schedule_once(
-            lambda *_: self.refresh_remote(),
-            .4,
-        )
+    # --------------------------------------------------------
+    # CABEÇALHO / IDENTIDADE
+    # --------------------------------------------------------
 
     def render_header(self):
         self.header.clear_widgets()
-
         app = App.get_running_app()
 
-        c = Card(
-            orientation="horizontal",
-            padding=[
-                dp(16),
-                dp(9),
-            ],
-        )
-
-        left = BoxLayout(
-            orientation="vertical"
-        )
-
-        left.add_widget(
-            lbl(
-                "APS SERRA · OPERAÇÃO",
-                C_TEXT,
-                sp(21),
-                dp(34),
-                True,
-            )
-        )
-
-        left.add_widget(
-            lbl(
-                (
-                    "Programação congelada · "
-                    f"{datetime.now():%d/%m/%Y}"
-                ),
-                C_MUTED,
-                sp(11),
-                dp(22),
-            )
-        )
-
+        c = Card(orientation="horizontal", padding=[dp(15), dp(7)], spacing=dp(8))
+        left = BoxLayout(orientation="vertical", size_hint_x=.55)
+        left.add_widget(lbl("APS SERRA · OPERAÇÃO", C_TEXT, sp(20), dp(30), True))
+        plan_code = self.plan.get("codigo_plano") if isinstance(self.plan, dict) else None
+        plan_text = f"Plano {plan_code}" if plan_code else "Programação congelada"
+        left.add_widget(lbl(plan_text, C_MUTED, sp(10), dp(20)))
         c.add_widget(left)
-        c.add_widget(Widget())
 
-        c.add_widget(
-            Status(
-                "ONLINE"
-                if app.online
-                else "OFFLINE",
-                "OK"
-                if app.online
-                else "BAD",
-            )
-        )
+        middle = BoxLayout(orientation="vertical", size_hint_x=.25)
+        self.clock_label = lbl("", C_TEXT, sp(18), dp(30), True)
+        self.shift_label = lbl("", C_MUTED, sp(10), dp(20), True)
+        middle.add_widget(self.clock_label)
+        middle.add_widget(self.shift_label)
+        c.add_widget(middle)
 
+        c.add_widget(Status("ONLINE" if app.online else "OFFLINE", "OK" if app.online else "BAD"))
         self.header.add_widget(c)
+        self._tick()
+
+    def _tick(self, *_):
+        now = br_now()
+        turno, janela = shift_info(now)
+        if hasattr(self, "clock_label"):
+            self.clock_label.text = now.strftime("%d/%m · %H:%M:%S")
+        if hasattr(self, "shift_label"):
+            self.shift_label.text = f"{turno} · {janela}"
+        self.render_footer()
+
+    def render_footer(self):
+        self.footer.clear_widgets()
+        now = br_now()
+        turno, _ = shift_info(now)
+        text = (
+            "T1 06:00–15:48   ·   T2 16:00–01:20   ·   "
+            "Após 01:20: finalizar tarefa ou registrar hora extra"
+        )
+        tone = C_YELLOW if turno == "HORA EXTRA" else C_MUTED
+        self.footer.add_widget(lbl(text, tone, sp(9), dp(24), turno == "HORA EXTRA"))
 
     def build_identity(self):
         self.identity.clear_widgets()
-
         app = App.get_running_app()
 
-        opbox = BoxLayout(
-            orientation="vertical",
-            size_hint_x=.43,
-            spacing=dp(2),
-        )
-
-        opbox.add_widget(
-            lbl(
-                "NOME DO OPERADOR · OBRIGATÓRIO",
-                C_TEXT,
-                sp(10),
-                dp(18),
-                True,
-            )
-        )
-
-        self.operator = Field(
-            hint_text="Digite seu nome completo"
-        )
-
-        self.operator.text = (
-            app.store.data["config"].get(
-                "last_operator",
-                "",
-            )
-        )
-
+        opbox = BoxLayout(orientation="vertical", size_hint_x=.42, spacing=dp(1))
+        opbox.add_widget(lbl("OPERADOR", C_MUTED, sp(9), dp(18), True))
+        self.operator = Field(hint_text="Nome do operador")
+        self.operator.text = app.store.data.get("config", {}).get("last_operator", "")
         opbox.add_widget(self.operator)
 
-        mbox = BoxLayout(
-            orientation="vertical",
-            size_hint_x=.27,
-            spacing=dp(2),
-        )
-
-        mbox.add_widget(
-            lbl(
-                "MÁQUINA",
-                C_TEXT,
-                sp(10),
-                dp(18),
-                True,
-            )
-        )
-
+        mbox = BoxLayout(orientation="vertical", size_hint_x=.22, spacing=dp(1))
+        mbox.add_widget(lbl("MÁQUINA", C_MUTED, sp(9), dp(18), True))
         self.machine = Spinner(
-            text=app.store.data[
-                "config"
-            ].get(
-                "machine",
-                "SER-01",
-            ),
-            values=(
-                "SER-01",
-                "SER-02",
-                "SER-03",
-                "SER-04",
-                "SER-05",
-            ),
+            text=app.store.data.get("config", {}).get("machine", "SER-01"),
+            values=("SER-01", "SER-02", "SER-03", "SER-04", "SER-05"),
             background_normal="",
             background_color=C_DARK,
             color=C_TEXT,
             size_hint_y=None,
-            height=dp(50),
-            font_size=sp(15),
+            height=dp(46),
+            font_size=sp(14),
         )
-
         mbox.add_widget(self.machine)
 
-        btn = FlatButton(
-            "CARREGAR FILA",
-            bg=C_BLUE,
-            size_hint_x=.25,
-            height=dp(50),
-        )
+        load_btn = FlatButton("ATUALIZAR FILA", bg=C_BLUE, size_hint_x=.20, height=dp(46))
+        load_btn.bind(on_release=lambda *_: self.apply_identity())
 
-        btn.bind(
-            on_release=lambda *_:
-            self.apply_identity()
-        )
+        hist_btn = FlatButton("HISTÓRICO", bg=C_DARK, size_hint_x=.16, height=dp(46))
+        hist_btn.bind(on_release=lambda *_: self.show_history_popup())
 
         self.identity.add_widget(opbox)
         self.identity.add_widget(mbox)
-        self.identity.add_widget(btn)
-
-    def build_nav(self):
-        self.nav.clear_widgets()
-
-        for t, fn in [
-            (
-                "OPERAÇÃO",
-                self.show_operation,
-            ),
-            (
-                "FILA",
-                self.show_queue,
-            ),
-            (
-                "HISTÓRICO",
-                self.show_history,
-            ),
-        ]:
-            b = FlatButton(t)
-            b.bind(on_release=fn)
-            self.nav.add_widget(b)
+        self.identity.add_widget(load_btn)
+        self.identity.add_widget(hist_btn)
 
     def operator_ok(self, show=True):
         name = self.operator.text.strip()
-
         if not name and show:
-            self.popup(
-                "OPERADOR OBRIGATÓRIO",
-                (
-                    "Informe o nome do operador "
-                    "antes de executar qualquer ação."
-                ),
-            )
-
+            self.popup("OPERADOR OBRIGATÓRIO", "Informe o nome do operador antes de executar qualquer ação.")
         return bool(name)
 
     def apply_identity(self):
         if not self.operator_ok():
             return
-
         app = App.get_running_app()
-
         try:
-            app.operator = (
-                self.operator.text.strip()
-            )
+            app.operator = self.operator.text.strip()
             app.machine = self.machine.text
-
             app.store.data["config"] = {
                 "machine": app.machine,
-                "last_operator": (
-                    app.operator
-                ),
+                "last_operator": app.operator,
             }
-
             app.store.save()
             self.refresh_remote()
-
         except Exception as e:
             app.online = False
-
             try:
-                save_crash_report(
-                    traceback.format_exc(),
-                    app,
-                )
+                save_crash_report(traceback.format_exc(), app)
             except Exception:
                 pass
+            self.popup("ERRO AO CARREGAR FILA", str(e))
 
-            self.popup(
-                "ERRO AO CARREGAR FILA",
-                str(e),
-            )
+    # --------------------------------------------------------
+    # DADOS / REFRESH
+    # --------------------------------------------------------
 
     def load_cached(self):
         app = App.get_running_app()
-
-        self.orders = (
-            app.store.data.get(
-                "orders",
-                [],
-            )
-        )
-
-        self.show_operation()
+        self.orders = app.store.data.get("orders", [])
+        self.plan = app.store.data.get("plan", {}) or {}
+        self.render_header()
+        self.render_workspace()
 
     def refresh_remote(self):
         if self.busy:
             return
-
         if not self.operator_ok(False):
-            self.show_operation()
+            self.render_workspace()
             return
 
         app = App.get_running_app()
-
-        app.operator = (
-            self.operator.text.strip()
-        )
+        app.operator = self.operator.text.strip()
         app.machine = self.machine.text
-
         self.busy = True
 
         def work():
             try:
-                data = app.api.queue(
-                    app.machine
-                )
-
-                if isinstance(
-                    data,
-                    dict,
-                ):
-                    rows = (
-                        data.get(
-                            "orders",
-                            [],
-                        )
-                        or []
-                    )
-                    plan = (
-                        data.get(
-                            "plan",
-                            {},
-                        )
-                    )
+                data = app.api.queue(app.machine)
+                if isinstance(data, dict):
+                    rows = data.get("orders", []) or []
+                    plan = data.get("plan", {}) or {}
                 else:
-                    rows = data or []
-                    plan = {}
+                    rows, plan = data or [], {}
 
                 Clock.schedule_once(
-                    lambda *_args, rows=rows, plan=plan:
-                    self._refresh_ok(
-                        rows,
-                        plan,
-                    ),
-                    0,
+                    lambda *_args, rows=rows, plan=plan: self._refresh_ok(rows, plan), 0
                 )
-
             except Exception as e:
-                # IMPORTANTE:
-                # A variável de exceção "e" é apagada pelo Python ao sair
-                # do bloco except. Se ela for usada diretamente dentro de
-                # um lambda executado depois pelo Clock, o callback pode
-                # gerar NameError e derrubar o processo do Kivy.
-                error_message = str(e)
-                error_trace = traceback.format_exc()
-
+                msg = str(e)
+                trace = traceback.format_exc()
                 try:
-                    save_crash_report(
-                        error_trace,
-                        app,
-                    )
+                    save_crash_report(trace, app)
                 except Exception:
                     pass
-
                 Clock.schedule_once(
-                    lambda *_args, msg=error_message:
-                    self._refresh_fail(msg),
-                    0,
+                    lambda *_args, msg=msg: self._refresh_fail(msg), 0
                 )
 
-        threading.Thread(
-            target=work,
-            daemon=True,
-        ).start()
+        threading.Thread(target=work, daemon=True).start()
 
-    def _refresh_ok(
-        self,
-        rows,
-        plan,
-    ):
+    def _refresh_ok(self, rows, plan):
         app = App.get_running_app()
-
         self.busy = False
         app.online = True
         self.orders = rows
-
+        self.plan = plan or {}
         app.store.data["orders"] = rows
-        app.store.data["plan"] = plan
-
+        app.store.data["plan"] = self.plan
         app.store.save()
-
         self.render_header()
-        self.show_operation()
+        self.render_workspace()
+        Clock.schedule_once(lambda *_: self.check_shift_boundary(), .2)
 
-    def _refresh_fail(
-        self,
-        msg,
-    ):
+    def _refresh_fail(self, msg):
         app = App.get_running_app()
-
         self.busy = False
         app.online = False
-
+        self.render_header()
         try:
-            self.render_header()
+            app.store.event(f"Falha de comunicação: {msg}")
         except Exception:
             pass
+        self.render_workspace()
+        self.popup(
+            "SEM COMUNICAÇÃO",
+            f"Não foi possível atualizar o Supabase.\n\n{msg}\n\nA última fila salva permanece visível.",
+        )
 
-        try:
-            app.store.event(
-                f"Falha de comunicação: {msg}"
-            )
-        except Exception:
-            pass
+    # --------------------------------------------------------
+    # FILA / ORDEM ATUAL
+    # --------------------------------------------------------
 
-        try:
-            self.show_operation()
-        except Exception:
-            pass
+    def status_upper(self, order):
+        return str(order.get("status", "")).upper()
 
-        try:
-            self.popup(
-                "SEM COMUNICAÇÃO",
-                (
-                    "Não foi possível atualizar "
-                    "o Supabase.\n\n"
-                    f"{msg}\n\n"
-                    "A última fila salva permanece "
-                    "visível."
-                ),
-            )
-        except Exception:
-            # Último fallback: se até o Popup falhar, substitui o conteúdo
-            # por uma mensagem simples sem encerrar o aplicativo.
-            try:
-                self.content.clear_widgets()
-                self.content.add_widget(
-                    lbl(
-                        "ERRO AO CARREGAR FILA",
-                        C_RED,
-                        sp(20),
-                        dp(50),
-                        True,
-                    )
-                )
-                self.content.add_widget(
-                    lbl(
-                        str(msg),
-                        C_TEXT,
-                        sp(12),
-                        dp(120),
-                    )
-                )
-            except Exception:
-                pass
+    def active_order(self):
+        for order in self.orders:
+            if self.status_upper(order) in self.ACTIVE_STATUSES and order.get("active_execution_id"):
+                return order
+        return None
 
     def current(self):
-        opened = [
-            r
-            for r in self.orders
-            if str(
-                r.get(
-                    "status",
-                    "",
-                )
-            ).upper()
-            != "CONCLUIDA"
-        ]
+        active = self.active_order()
+        if active:
+            return active
+        opened = [o for o in self.orders if self.status_upper(o) != "CONCLUIDA"]
+        opened.sort(key=lambda o: int(o.get("seq", 999999) or 999999))
+        return opened[0] if opened else None
 
-        opened.sort(
-            key=lambda r:
-            int(
-                r.get(
-                    "seq",
-                    999999,
-                )
-                or 999999
-            )
-        )
+    def first_pending(self):
+        opened = [o for o in self.orders if self.status_upper(o) != "CONCLUIDA"]
+        opened.sort(key=lambda o: int(o.get("seq", 999999) or 999999))
+        return opened[0] if opened else None
 
-        return (
-            opened[0]
-            if opened
-            else None
-        )
-
-    def tone(self, s):
-        s = str(s).upper()
-
-        if s in (
-            "EM_PRODUCAO",
-            "EM PRODUCAO",
-            "EM_SETUP",
-            "EM SETUP",
-        ):
+    def tone(self, status):
+        s = str(status).upper()
+        if s in ("EM_PRODUCAO", "EM PRODUCAO", "EM_SETUP", "EM SETUP"):
             return "RUN"
-
         if s == "CONCLUIDA":
             return "OK"
-
-        if s in (
-            "PAUSADA",
-            "PARCIAL",
-        ):
+        if s in ("PAUSADA", "PARCIAL"):
             return "WARN"
-
         if s == "BLOQUEADA":
             return "BAD"
-
         return "WAIT"
 
-    def cell(
-        self,
-        title,
-        value,
-    ):
+    def cell(self, title, value, accent=C_TEXT):
         c = Card(
             orientation="vertical",
-            padding=[
-                dp(10),
-                dp(6),
-            ],
+            padding=[dp(9), dp(5)],
             spacing=0,
-            radius=dp(11),
-            bg_color=(
-                .035,
-                .075,
-                .12,
-                1,
-            ),
+            radius=dp(10),
+            bg_color=(.035, .075, .12, 1),
         )
-
-        c.add_widget(
-            lbl(
-                title,
-                C_MUTED,
-                sp(9),
-                dp(24),
-                True,
-            )
-        )
-
-        c.add_widget(
-            lbl(
-                value,
-                C_TEXT,
-                sp(16),
-                dp(32),
-                True,
-            )
-        )
-
+        c.add_widget(lbl(title, C_MUTED, sp(8), dp(20), True))
+        c.add_widget(lbl(value, accent, sp(15), dp(30), True))
         return c
 
-    def show_operation(self, *_):
-        self.content.clear_widgets()
+    def render_workspace(self):
+        self.body.clear_widgets()
 
+        left = BoxLayout(orientation="vertical", size_hint_x=.72, spacing=dp(7))
+        side = Card(
+            orientation="vertical",
+            size_hint_x=.28,
+            padding=[dp(10), dp(9)],
+            spacing=dp(6),
+            bg_color=(.035, .07, .115, 1),
+        )
+
+        self.render_current(left)
+        self.render_queue_side(side)
+        self.body.add_widget(left)
+        self.body.add_widget(side)
+
+    def render_current(self, parent):
         app = App.get_running_app()
-
         if not self.operator.text.strip():
-            c = Card(
-                orientation="vertical",
-                padding=dp(24),
-            )
-
-            c.add_widget(
-                lbl(
-                    "IDENTIFIQUE O OPERADOR",
-                    C_TEXT,
-                    sp(25),
-                    dp(50),
-                    True,
-                )
-            )
-
-            c.add_widget(
-                lbl(
-                    (
-                        "Informe o nome e escolha "
-                        "a máquina no topo. "
-                        "Não há senha nem tela de login."
-                    ),
-                    C_MUTED,
-                    sp(14),
-                    dp(54),
-                )
-            )
-
-            self.content.add_widget(c)
+            c = Card(orientation="vertical", padding=dp(22))
+            c.add_widget(lbl("IDENTIFIQUE O OPERADOR", C_TEXT, sp(24), dp(52), True))
+            c.add_widget(lbl(
+                "Informe o operador e a máquina. A fila aparecerá ao lado e a ordem atual ocupará a área principal.",
+                C_MUTED, sp(13), dp(60)
+            ))
+            parent.add_widget(c)
             return
 
         o = self.current()
-
         if not o:
-            c = Card(
-                orientation="vertical"
-            )
-
-            c.add_widget(
-                lbl(
-                    "FILA CONCLUÍDA",
-                    C_GREEN,
-                    sp(27),
-                    dp(60),
-                    True,
-                )
-            )
-
-            c.add_widget(
-                lbl(
-                    (
-                        "Nenhuma ordem aberta "
-                        f"para {app.machine}."
-                    ),
-                    C_MUTED,
-                    sp(14),
-                    dp(40),
-                )
-            )
-
-            self.content.add_widget(c)
+            c = Card(orientation="vertical", padding=dp(22))
+            c.add_widget(lbl("FILA CONCLUÍDA", C_GREEN, sp(26), dp(58), True))
+            c.add_widget(lbl(f"Nenhuma ordem aberta para {app.machine}.", C_MUTED, sp(13), dp(38)))
+            parent.add_widget(c)
             return
 
-        self.content.add_widget(
-            lbl(
-                "ORDEM ATUAL",
-                C_BLUE,
-                sp(11),
-                dp(24),
-                True,
-            )
-        )
+        c = Card(orientation="vertical", padding=dp(16), spacing=dp(8))
 
-        c = Card(
-            orientation="vertical",
-            padding=dp(17),
-            spacing=dp(9),
-        )
-
-        top = BoxLayout(
-            size_hint_y=None,
-            height=dp(66),
-        )
-
-        left = BoxLayout(
-            orientation="vertical"
-        )
-
-        left.add_widget(
-            lbl(
-                f'OP {o.get("op", "")}',
-                C_TEXT,
-                sp(24),
-                dp(34),
-                True,
-            )
-        )
-
-        left.add_widget(
-            lbl(
-                (
-                    f'{o.get("item", "")} · '
-                    f'{o.get("description", "")}'
-                ),
-                C_MUTED,
-                sp(12),
-                dp(28),
-            )
-        )
-
-        top.add_widget(left)
-
-        top.add_widget(
-            Status(
-                str(
-                    o.get(
-                        "status",
-                        "AGUARDANDO",
-                    )
-                ),
-                self.tone(
-                    o.get("status")
-                ),
-            )
-        )
-
+        top = BoxLayout(size_hint_y=None, height=dp(70), spacing=dp(8))
+        info = BoxLayout(orientation="vertical")
+        info.add_widget(lbl(f'OP {o.get("op", "")}', C_TEXT, sp(24), dp(36), True))
+        desc = f'{o.get("item", "")} · {o.get("description", "")}'
+        info.add_widget(lbl(desc, C_MUTED, sp(11), dp(28)))
+        top.add_widget(info)
+        top.add_widget(Status(str(o.get("status", "AGUARDANDO")), self.tone(o.get("status"))))
         c.add_widget(top)
 
-        planned = float(
-            o.get(
-                "planned_qty",
-                0,
-            )
-            or 0
-        )
+        planned = safe_float(o.get("planned_qty"))
+        done = safe_float(o.get("done_qty"))
+        saldo = max(0.0, planned - done)
 
-        done = float(
-            o.get(
-                "done_qty",
-                0,
-            )
-            or 0
-        )
+        metrics = GridLayout(cols=4, size_hint_y=None, height=dp(70), spacing=dp(7))
+        metrics.add_widget(self.cell("SEQUÊNCIA", f'{int(o.get("seq", 0) or 0):02d}', C_BLUE))
+        metrics.add_widget(self.cell("PROGRAMADO", f"{planned:g} pç"))
+        metrics.add_widget(self.cell("REALIZADO", f"{done:g} pç", C_GREEN))
+        metrics.add_widget(self.cell("SALDO", f"{saldo:g} pç", C_YELLOW if saldo else C_GREEN))
+        c.add_widget(metrics)
+        c.add_widget(Progress(value=100 * done / max(1, planned)))
 
-        saldo = max(
-            0,
-            planned - done,
-        )
+        exec_meta = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(7))
+        active_start = hhmm(o.get("active_inicio_em")) if o.get("active_execution_id") else "--:--"
+        turno = str(o.get("active_turno") or "-")
+        operador = str(o.get("active_operador") or app.operator or "-")
+        he = " · HORA EXTRA" if o.get("active_hora_extra") else ""
+        exec_meta.add_widget(lbl(f"INÍCIO: {active_start}", C_MUTED, sp(10), dp(38), True))
+        exec_meta.add_widget(lbl(f"TURNO: {turno}{he}", C_MUTED, sp(10), dp(38), True))
+        exec_meta.add_widget(lbl(f"OPERADOR: {operador}", C_MUTED, sp(10), dp(38), True))
+        c.add_widget(exec_meta)
 
-        g = GridLayout(
-            cols=4,
-            size_hint_y=None,
-            height=dp(78),
-            spacing=dp(8),
-        )
+        actions = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(8))
+        s = self.status_upper(o)
 
-        g.add_widget(
-            self.cell(
-                "SEQUÊNCIA",
-                (
-                    f'{int(o.get("seq", 0) or 0):02d}'
-                ),
-            )
-        )
-
-        g.add_widget(
-            self.cell(
-                "PROGRAMADO",
-                f"{planned:g} pç",
-            )
-        )
-
-        g.add_widget(
-            self.cell(
-                "REALIZADO",
-                f"{done:g} pç",
-            )
-        )
-
-        g.add_widget(
-            self.cell(
-                "SALDO",
-                f"{saldo:g} pç",
-            )
-        )
-
-        c.add_widget(g)
-
-        c.add_widget(
-            Progress(
-                value=(
-                    100
-                    * done
-                    / max(
-                        1,
-                        planned,
-                    )
-                )
-            )
-        )
-
-        active = o.get(
-            "active_execution_id"
-        )
-
-        self.active_execution_id = active
-
-        actions = BoxLayout(
-            size_hint_y=None,
-            height=dp(60),
-            spacing=dp(10),
-        )
-
-        s = str(
-            o.get(
-                "status",
-                "",
-            )
-        ).upper()
-
-        if s in (
-            "AGUARDANDO",
-            "PARCIAL",
-        ):
-            b = FlatButton(
-                "INICIAR ORDEM",
-                bg=C_BLUE,
-                height=dp(58),
-            )
-
-            b.bind(
-                on_release=lambda *_:
-                self.ask_setup(o)
-            )
-
+        if s in ("AGUARDANDO", "PARCIAL"):
+            b = FlatButton("INICIAR", bg=C_BLUE, height=dp(56))
+            b.bind(on_release=lambda *_: self.open_start_dialog(o, require_reason=False))
             actions.add_widget(b)
 
-        elif s in (
-            "EM_SETUP",
-            "EM SETUP",
-        ):
-            b = FlatButton(
-                "FINALIZAR SETUP",
-                bg=C_YELLOW,
-                fg=(
-                    .05,
-                    .06,
-                    .08,
-                    1,
-                ),
-                height=dp(58),
-            )
-
-            b.bind(
-                on_release=lambda *_:
-                self.command(
-                    "setup",
-                    o,
-                )
-            )
-
+        elif s in ("EM_SETUP", "EM SETUP"):
+            b = FlatButton("FINALIZAR SETUP", bg=C_YELLOW, fg=(.04, .05, .07, 1), height=dp(56))
+            b.bind(on_release=lambda *_: self.command("setup", o))
             actions.add_widget(b)
 
-        elif s in (
-            "EM_PRODUCAO",
-            "EM PRODUCAO",
-        ):
-            p = FlatButton(
-                "PAUSAR",
-                height=dp(58),
-            )
-
-            p.bind(
-                on_release=lambda *_:
-                self.command(
-                    "pause",
-                    o,
-                )
-            )
-
-            f = FlatButton(
-                "FINALIZAR APONTAMENTO",
-                bg=C_GREEN,
-                height=dp(58),
-            )
-
-            f.bind(
-                on_release=lambda *_:
-                self.finish_popup(o)
-            )
-
-            actions.add_widget(p)
-            actions.add_widget(f)
+        elif s in ("EM_PRODUCAO", "EM PRODUCAO"):
+            partial = FlatButton("APONTAR PARCIAL", bg=C_BLUE, height=dp(56))
+            partial.bind(on_release=lambda *_: self.open_quantity_dialog(o, "PARCIAL"))
+            pause = FlatButton("PAUSAR", bg=C_DARK, height=dp(56))
+            pause.bind(on_release=lambda *_: self.command("pause", o))
+            finish = FlatButton("CONCLUIR OP", bg=C_GREEN, height=dp(56))
+            finish.bind(on_release=lambda *_: self.open_quantity_dialog(o, "CONCLUSAO"))
+            actions.add_widget(partial)
+            actions.add_widget(pause)
+            actions.add_widget(finish)
 
         elif s == "PAUSADA":
-            r = FlatButton(
-                "RETOMAR",
-                bg=C_BLUE,
-                height=dp(58),
-            )
-
-            r.bind(
-                on_release=lambda *_:
-                self.command(
-                    "resume",
-                    o,
-                )
-            )
-
-            f = FlatButton(
-                "FINALIZAR APONTAMENTO",
-                bg=C_GREEN,
-                height=dp(58),
-            )
-
-            f.bind(
-                on_release=lambda *_:
-                self.finish_popup(o)
-            )
-
-            actions.add_widget(r)
-            actions.add_widget(f)
+            partial = FlatButton("APONTAR PARCIAL", bg=C_BLUE, height=dp(56))
+            partial.bind(on_release=lambda *_: self.open_quantity_dialog(o, "PARCIAL"))
+            resume = FlatButton("RETOMAR", bg=C_YELLOW, fg=(.04, .05, .07, 1), height=dp(56))
+            resume.bind(on_release=lambda *_: self.command("resume", o))
+            finish = FlatButton("CONCLUIR OP", bg=C_GREEN, height=dp(56))
+            finish.bind(on_release=lambda *_: self.open_quantity_dialog(o, "CONCLUSAO"))
+            actions.add_widget(partial)
+            actions.add_widget(resume)
+            actions.add_widget(finish)
 
         c.add_widget(actions)
-        self.content.add_widget(c)
+        parent.add_widget(c)
 
-    def ask_setup(
-        self,
-        o,
-    ):
+    def render_queue_side(self, side):
+        side.add_widget(lbl("PRÓXIMOS DA FILA", C_TEXT, sp(13), dp(30), True))
+        side.add_widget(lbl("Toque em ESCOLHER para mudar a sequência.", C_MUTED, sp(9), dp(28)))
+
+        current = self.current()
+        current_id = current.get("operation_id") if current else None
+        rows = [o for o in self.orders if self.status_upper(o) != "CONCLUIDA" and o.get("operation_id") != current_id]
+        rows.sort(key=lambda o: int(o.get("seq", 999999) or 999999))
+
+        sc = ScrollView(do_scroll_x=False)
+        stack = GridLayout(cols=1, spacing=dp(6), size_hint_y=None)
+        stack.bind(minimum_height=stack.setter("height"))
+
+        if not rows:
+            stack.add_widget(lbl("Sem próximos itens.", C_MUTED, sp(11), dp(52)))
+
+        for o in rows[:8]:
+            planned = safe_float(o.get("planned_qty"))
+            done = safe_float(o.get("done_qty"))
+            saldo = max(0, planned - done)
+
+            card = Card(
+                orientation="vertical",
+                size_hint_y=None,
+                height=dp(118),
+                padding=[dp(8), dp(6)],
+                spacing=dp(2),
+                radius=dp(10),
+                bg_color=(.045, .085, .135, 1),
+            )
+            row1 = BoxLayout(size_hint_y=None, height=dp(27))
+            row1.add_widget(lbl(f'#{int(o.get("seq", 0) or 0):02d} · OP {o.get("op", "")}', C_TEXT, sp(10), dp(25), True))
+            row1.add_widget(Status(str(o.get("status", "")), self.tone(o.get("status"))))
+            card.add_widget(row1)
+            card.add_widget(lbl(str(o.get("item", "")), C_BLUE, sp(10), dp(22), True))
+            card.add_widget(lbl(f"Saldo {saldo:g} pç", C_MUTED, sp(9), dp(20)))
+            choose = FlatButton("ESCOLHER", bg=C_DARK, height=dp(34))
+            choose.bind(on_release=lambda *_args, order=o: self.select_queue_order(order))
+            card.add_widget(choose)
+            stack.add_widget(card)
+
+        sc.add_widget(stack)
+        side.add_widget(sc)
+
+    # --------------------------------------------------------
+    # INICIAR / TROCAR FILA
+    # --------------------------------------------------------
+
+    def select_queue_order(self, order):
         if not self.operator_ok():
             return
 
-        box = BoxLayout(
-            orientation="vertical",
-            padding=dp(20),
-            spacing=dp(12),
-        )
-
-        box.add_widget(
-            lbl(
-                "INICIAR ORDEM",
-                C_TEXT,
-                sp(22),
-                dp(42),
-                True,
-            )
-        )
-
-        box.add_widget(
-            lbl(
-                "Esta ordem exige setup?",
-                C_MUTED,
-                sp(14),
-                dp(40),
-            )
-        )
-
-        row = BoxLayout(
-            size_hint_y=None,
-            height=dp(60),
-            spacing=dp(10),
-        )
-
-        no = FlatButton(
-            "SEM SETUP",
-            bg=C_BLUE,
-        )
-
-        yes = FlatButton(
-            "COM SETUP",
-            bg=C_YELLOW,
-            fg=(
-                .05,
-                .06,
-                .08,
-                1,
-            ),
-        )
-
-        row.add_widget(no)
-        row.add_widget(yes)
-
-        box.add_widget(row)
-
-        pop = Popup(
-            title="",
-            content=box,
-            size_hint=(.7, .5),
-            separator_height=0,
-        )
-
-        no.bind(
-            on_release=lambda *_:
-            (
-                pop.dismiss(),
-                self.start_remote(
-                    o,
-                    False,
-                ),
-            )
-        )
-
-        yes.bind(
-            on_release=lambda *_:
-            (
-                pop.dismiss(),
-                self.start_remote(
-                    o,
-                    True,
-                ),
-            )
-        )
-
-        pop.open()
-
-    def start_remote(
-        self,
-        o,
-        setup,
-    ):
-        app = App.get_running_app()
-
-        try:
-            app.api.start(
-                o["operation_id"],
-                app.machine,
-                self.operator.text.strip(),
-                setup,
-                app.device_id,
-            )
-
-            app.online = True
-
-            app.store.event(
-                (
-                    f'OP {o.get("op")}: '
-                    "início confirmado no Supabase."
-                )
-            )
-
-            self.refresh_remote()
-
-        except Exception as e:
-            app.online = False
-            self.render_header()
-
-            self.popup(
-                "FALHA AO INICIAR",
-                str(e),
-            )
-
-    def command(
-        self,
-        kind,
-        o,
-    ):
-        app = App.get_running_app()
-
-        exec_id = o.get(
-            "active_execution_id"
-        )
-
-        if not exec_id:
-            self.popup(
-                "SEM EXECUÇÃO",
-                (
-                    "Não foi encontrada execução "
-                    "ativa no Supabase."
-                ),
-            )
+        active = self.active_order()
+        if active and active.get("operation_id") != order.get("operation_id"):
+            self.open_switch_reason(active, order)
             return
 
-        try:
-            {
-                "setup": (
-                    app.api.finish_setup
-                ),
-                "pause": (
-                    app.api.pause
-                ),
-                "resume": (
-                    app.api.resume
-                ),
-            }[kind](exec_id)
+        first = self.first_pending()
+        require_reason = bool(first and first.get("operation_id") != order.get("operation_id"))
+        self.open_start_dialog(order, require_reason=require_reason)
 
-            app.store.event(
-                (
-                    f'OP {o.get("op")}: '
-                    f"comando {kind} confirmado."
-                )
-            )
-
-            self.refresh_remote()
-
-        except Exception as e:
-            self.popup(
-                "ERRO DE COMUNICAÇÃO",
-                str(e),
-            )
-
-    def finish_popup(
-        self,
-        o,
-    ):
-        balance = max(
-            0,
-            float(
-                o.get(
-                    "planned_qty",
-                    0,
-                )
-                or 0
-            )
-            - float(
-                o.get(
-                    "done_qty",
-                    0,
-                )
-                or 0
+    def reason_widgets(self):
+        reason = Spinner(
+            text="SELECIONE O MOTIVO",
+            values=(
+                "PRIORIDADE PCP",
+                "FALTA DE MATERIAL",
+                "SETUP / OTIMIZAÇÃO",
+                "MANUTENÇÃO / BLOQUEIO",
+                "QUALIDADE",
+                "OUTRO",
             ),
-        )
-
-        box = BoxLayout(
-            orientation="vertical",
-            padding=dp(18),
-            spacing=dp(7),
-        )
-
-        box.add_widget(
-            lbl(
-                "FINALIZAR APONTAMENTO",
-                C_TEXT,
-                sp(22),
-                dp(40),
-                True,
-            )
-        )
-
-        g = GridLayout(
-            cols=2,
+            background_normal="",
+            background_color=C_DARK,
+            color=C_TEXT,
             size_hint_y=None,
-            height=dp(120),
-            spacing=dp(8),
+            height=dp(46),
         )
+        detail = Field(hint_text="Detalhe / justificativa")
+        return reason, detail
 
-        a = BoxLayout(
-            orientation="vertical"
-        )
-        b = BoxLayout(
-            orientation="vertical"
-        )
+    def compose_reason(self, reason, detail):
+        base = reason.text.strip()
+        extra = detail.text.strip()
+        if base == "SELECIONE O MOTIVO":
+            return ""
+        return f"{base} · {extra}" if extra else base
 
-        a.add_widget(
-            lbl(
-                "QUANTIDADE BOA",
-                C_TEXT,
-                sp(10),
-                dp(24),
-                True,
+    def open_switch_reason(self, current_order, target_order):
+        box = BoxLayout(orientation="vertical", padding=dp(18), spacing=dp(8))
+        box.add_widget(lbl("TROCAR ORDEM DA FILA", C_TEXT, sp(20), dp(38), True))
+        box.add_widget(lbl(
+            f'Atual: OP {current_order.get("op", "")}  →  Selecionada: OP {target_order.get("op", "")}',
+            C_MUTED, sp(11), dp(35)
+        ))
+        box.add_widget(lbl(
+            "Para trocar uma ordem ativa, o apontamento produzido até agora será registrado como parcial.",
+            C_YELLOW, sp(11), dp(48), True
+        ))
+        reason, detail = self.reason_widgets()
+        box.add_widget(reason)
+        box.add_widget(detail)
+        msg = lbl("", C_RED, sp(10), dp(24), True)
+        box.add_widget(msg)
+        row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+        back = FlatButton("CANCELAR")
+        go = FlatButton("APONTAR E TROCAR", bg=C_BLUE)
+        row.add_widget(back)
+        row.add_widget(go)
+        box.add_widget(row)
+        pop = Popup(title="", content=box, size_hint=(.78, .80), separator_height=0)
+        back.bind(on_release=lambda *_: pop.dismiss())
+
+        def continue_switch(*_):
+            queue_reason = self.compose_reason(reason, detail)
+            if not queue_reason:
+                msg.text = "Justificativa obrigatória para mudar a sequência."
+                return
+            pop.dismiss()
+            self.open_quantity_dialog(
+                current_order,
+                "TROCA_FILA",
+                after_success=lambda: self.open_start_dialog(
+                    target_order, require_reason=False, forced_reason=queue_reason
+                ),
+                note_prefix=f"Troca de fila: {queue_reason}",
             )
-        )
 
-        qty = Field(
-            text=f"{balance:g}",
-            input_filter="float",
+        go.bind(on_release=continue_switch)
+        pop.open()
+
+    def open_start_dialog(self, order, require_reason=False, forced_reason=None):
+        if self.active_order() and self.active_order().get("operation_id") != order.get("operation_id"):
+            self.popup("EXECUÇÃO ATIVA", "Existe outra ordem em execução. Faça um apontamento parcial antes de trocar.")
+            return
+
+        box = BoxLayout(orientation="vertical", padding=dp(17), spacing=dp(7))
+        box.add_widget(lbl("INICIAR ORDEM", C_TEXT, sp(20), dp(38), True))
+        box.add_widget(lbl(
+            f'OP {order.get("op", "")} · {order.get("item", "")}',
+            C_BLUE, sp(13), dp(31), True
+        ))
+
+        setup = Spinner(
+            text="SEM SETUP",
+            values=("SEM SETUP", "COM SETUP"),
+            background_normal="",
+            background_color=C_DARK,
+            color=C_TEXT,
+            size_hint_y=None,
+            height=dp(45),
         )
+        box.add_widget(lbl("SETUP", C_MUTED, sp(9), dp(18), True))
+        box.add_widget(setup)
+
+        mode = Spinner(
+            text="AGORA",
+            values=("AGORA", "MANUAL"),
+            background_normal="",
+            background_color=C_DARK,
+            color=C_TEXT,
+            size_hint_y=None,
+            height=dp(45),
+        )
+        box.add_widget(lbl("HORA DE INÍCIO", C_MUTED, sp(9), dp(18), True))
+        box.add_widget(mode)
+
+        dtrow = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(7))
+        now = br_now()
+        date_field = Field(text=now.strftime("%d/%m/%Y"), hint_text="DD/MM/AAAA")
+        time_field = Field(text=now.strftime("%H:%M"), hint_text="HH:MM")
+        date_field.disabled = True
+        time_field.disabled = True
+        dtrow.add_widget(date_field)
+        dtrow.add_widget(time_field)
+        box.add_widget(dtrow)
+
+        def mode_changed(_spinner, value):
+            manual = value == "MANUAL"
+            date_field.disabled = not manual
+            time_field.disabled = not manual
+
+        mode.bind(text=mode_changed)
+
+        reason = detail = None
+        if forced_reason:
+            box.add_widget(lbl("JUSTIFICATIVA DA TROCA", C_MUTED, sp(9), dp(18), True))
+            box.add_widget(lbl(forced_reason, C_YELLOW, sp(10), dp(38), True))
+        elif require_reason:
+            box.add_widget(lbl("JUSTIFICATIVA PARA FURAR FILA", C_MUTED, sp(9), dp(18), True))
+            reason, detail = self.reason_widgets()
+            box.add_widget(reason)
+            box.add_widget(detail)
+
+        msg = lbl("", C_RED, sp(10), dp(24), True)
+        box.add_widget(msg)
+        row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+        back = FlatButton("VOLTAR")
+        start_btn = FlatButton("INICIAR", bg=C_GREEN)
+        row.add_widget(back)
+        row.add_widget(start_btn)
+        box.add_widget(row)
+        pop = Popup(title="", content=box, size_hint=(.80, .93), separator_height=0)
+        back.bind(on_release=lambda *_: pop.dismiss())
+
+        def confirm(*_):
+            queue_reason = forced_reason
+            if require_reason and not forced_reason:
+                queue_reason = self.compose_reason(reason, detail)
+                if not queue_reason:
+                    msg.text = "Informe o motivo para mudar a sequência."
+                    return
+
+            start_at = None
+            check_dt = br_now()
+            if mode.text == "MANUAL":
+                try:
+                    manual_dt = parse_manual_datetime(date_field.text, time_field.text)
+                except Exception:
+                    msg.text = "Data/hora inválida. Use DD/MM/AAAA e HH:MM."
+                    return
+                if manual_dt > br_now() + timedelta(minutes=5):
+                    msg.text = "A hora de início não pode estar no futuro."
+                    return
+                start_at = manual_dt.isoformat()
+                check_dt = manual_dt
+
+            overtime = is_overtime_window(check_dt)
+            try:
+                app = App.get_running_app()
+                res = app.api.start(
+                    order["operation_id"],
+                    app.machine,
+                    self.operator.text.strip(),
+                    setup.text == "COM SETUP",
+                    app.device_id,
+                    start_at=start_at,
+                    queue_reason=queue_reason,
+                    overtime=overtime,
+                )
+                app.online = True
+                origin = "manual" if start_at else "agora"
+                app.store.event(f'OP {order.get("op")}: início {origin} confirmado.')
+                pop.dismiss()
+                self.refresh_remote()
+            except Exception as e:
+                msg.text = str(e)[:220]
+
+        start_btn.bind(on_release=confirm)
+        pop.open()
+
+    # --------------------------------------------------------
+    # APONTAMENTO / CONCLUSÃO
+    # --------------------------------------------------------
+
+    def open_quantity_dialog(self, order, kind, after_success=None, note_prefix=""):
+        exec_id = order.get("active_execution_id")
+        if not exec_id:
+            self.popup("SEM EXECUÇÃO", "Não foi encontrada execução ativa para esta ordem.")
+            return
+
+        planned = safe_float(order.get("planned_qty"))
+        done = safe_float(order.get("done_qty"))
+        balance = max(0, planned - done)
+
+        titles = {
+            "PARCIAL": "APONTAMENTO PARCIAL",
+            "CONCLUSAO": "CONCLUIR ORDEM",
+            "TROCA_FILA": "APONTAR ANTES DE TROCAR",
+            "VIRADA_TURNO": "FINALIZAR TAREFA / TURNO",
+        }
+        title = titles.get(kind, "APONTAMENTO")
+
+        box = BoxLayout(orientation="vertical", padding=dp(17), spacing=dp(7))
+        box.add_widget(lbl(title, C_TEXT, sp(20), dp(38), True))
+        box.add_widget(lbl(
+            f'OP {order.get("op", "")} · saldo atual {balance:g} pç',
+            C_MUTED, sp(11), dp(30)
+        ))
+
+        g = GridLayout(cols=2, size_hint_y=None, height=dp(94), spacing=dp(7))
+        a = BoxLayout(orientation="vertical")
+        b = BoxLayout(orientation="vertical")
+        a.add_widget(lbl("QUANTIDADE BOA", C_MUTED, sp(9), dp(20), True))
+        default_qty = f"{balance:g}" if kind == "CONCLUSAO" else ""
+        qty = Field(text=default_qty, hint_text="Quantidade", input_filter="float")
         a.add_widget(qty)
-
-        b.add_widget(
-            lbl(
-                "REFUGO",
-                C_TEXT,
-                sp(10),
-                dp(24),
-                True,
-            )
-        )
-
-        scrap = Field(
-            text="0",
-            input_filter="float",
-        )
+        b.add_widget(lbl("REFUGO", C_MUTED, sp(9), dp(20), True))
+        scrap = Field(text="0", input_filter="float")
         b.add_widget(scrap)
-
         g.add_widget(a)
         g.add_widget(b)
         box.add_widget(g)
 
-        note = Field(
-            hint_text="Observação opcional"
-        )
+        note = Field(hint_text="Observação opcional")
+        if note_prefix:
+            note.text = note_prefix
         box.add_widget(note)
 
-        msg = lbl(
-            "",
-            C_RED,
-            sp(11),
-            dp(24),
-        )
+        if kind in ("PARCIAL", "TROCA_FILA", "VIRADA_TURNO"):
+            box.add_widget(lbl(
+                "A ordem continuará na fila como PARCIAL se ainda existir saldo.",
+                C_YELLOW, sp(10), dp(35), True
+            ))
+
+        msg = lbl("", C_RED, sp(10), dp(24), True)
         box.add_widget(msg)
-
-        row = BoxLayout(
-            size_hint_y=None,
-            height=dp(58),
-            spacing=dp(8),
-        )
-
+        row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
         back = FlatButton("VOLTAR")
-
-        ok = FlatButton(
-            "CONFIRMAR",
-            bg=C_GREEN,
-        )
-
+        ok = FlatButton("CONFIRMAR", bg=C_GREEN)
         row.add_widget(back)
         row.add_widget(ok)
         box.add_widget(row)
-
-        pop = Popup(
-            title="",
-            content=box,
-            size_hint=(.78, .78),
-            separator_height=0,
-        )
-
-        back.bind(
-            on_release=lambda *_:
-            pop.dismiss()
-        )
+        pop = Popup(title="", content=box, size_hint=(.76, .78), separator_height=0)
+        back.bind(on_release=lambda *_: pop.dismiss())
 
         def confirm(*_):
             try:
-                q = float(
-                    qty.text.replace(
-                        ",",
-                        ".",
-                    )
-                )
-
-                r = float(
-                    scrap.text.replace(
-                        ",",
-                        ".",
-                    )
-                )
-
+                q = float(qty.text.replace(",", "."))
+                r = float(scrap.text.replace(",", "."))
             except Exception:
-                msg.text = (
-                    "Quantidades inválidas."
-                )
+                msg.text = "Quantidades inválidas."
                 return
-
             if q <= 0 or r < 0:
-                msg.text = (
-                    "Quantidade boa deve ser "
-                    "maior que zero."
-                )
+                msg.text = "Quantidade boa deve ser maior que zero e refugo não pode ser negativo."
                 return
-
-            exec_id = o.get(
-                "active_execution_id"
-            )
-
             try:
-                App.get_running_app().api.finish(
-                    exec_id,
-                    q,
-                    r,
-                    note.text.strip(),
-                )
-
+                app = App.get_running_app()
+                res = app.api.finish(exec_id, q, r, note.text.strip(), kind=kind)
+                order_status = (res or {}).get("order_status", "") if isinstance(res, dict) else ""
+                app.store.event(f'OP {order.get("op")}: {q:g} pç lançadas · {kind}.')
                 pop.dismiss()
-
-                App.get_running_app().store.event(
-                    (
-                        f'OP {o.get("op")}: '
-                        f"{q:g} peças apontadas."
-                    )
-                )
-
                 self.refresh_remote()
-
+                if after_success:
+                    Clock.schedule_once(lambda *_: after_success(), .65)
+                elif order_status:
+                    Clock.schedule_once(
+                        lambda *_: self.popup("APONTAMENTO SALVO", f"Situação da ordem: {order_status}"),
+                        .35,
+                    )
             except Exception as e:
-                msg.text = str(e)[:160]
+                msg.text = str(e)[:220]
 
-        ok.bind(
-            on_release=confirm
-        )
-
+        ok.bind(on_release=confirm)
         pop.open()
 
-    def show_queue(self, *_):
-        self.content.clear_widgets()
-
-        self.content.add_widget(
-            lbl(
-                "FILA OFICIAL DA MÁQUINA",
-                C_BLUE,
-                sp(11),
-                dp(24),
-                True,
-            )
-        )
-
-        sc = ScrollView(
-            do_scroll_x=False
-        )
-
-        stack = GridLayout(
-            cols=1,
-            spacing=dp(7),
-            size_hint_y=None,
-        )
-
-        stack.bind(
-            minimum_height=stack.setter(
-                "height"
-            )
-        )
-
-        for o in sorted(
-            self.orders,
-            key=lambda x:
-            int(
-                x.get(
-                    "seq",
-                    999999,
-                )
-                or 999999
-            ),
-        ):
-            c = Card(
-                orientation="horizontal",
-                size_hint_y=None,
-                height=dp(88),
-                padding=[
-                    dp(12),
-                    dp(9),
-                ],
-                spacing=dp(8),
-            )
-
-            c.add_widget(
-                lbl(
-                    (
-                        f'{int(o.get("seq", 0) or 0):02d}'
-                    ),
-                    C_BLUE,
-                    sp(18),
-                    dp(60),
-                    True,
-                )
-            )
-
-            mid = BoxLayout(
-                orientation="vertical"
-            )
-
-            mid.add_widget(
-                lbl(
-                    f'OP {o.get("op", "")}',
-                    C_TEXT,
-                    sp(14),
-                    dp(30),
-                    True,
-                )
-            )
-
-            mid.add_widget(
-                lbl(
-                    (
-                        f'{o.get("item", "")} · '
-                        f'{o.get("description", "")}'
-                    ),
-                    C_MUTED,
-                    sp(10),
-                    dp(28),
-                )
-            )
-
-            c.add_widget(mid)
-
-            c.add_widget(
-                lbl(
-                    (
-                        f'{float(o.get("done_qty", 0) or 0):g}/'
-                        f'{float(o.get("planned_qty", 0) or 0):g} pç'
-                    ),
-                    C_TEXT,
-                    sp(12),
-                    dp(55),
-                    True,
-                )
-            )
-
-            c.add_widget(
-                Status(
-                    str(
-                        o.get(
-                            "status",
-                            "",
-                        )
-                    ),
-                    self.tone(
-                        o.get("status")
-                    ),
-                )
-            )
-
-            stack.add_widget(c)
-
-        sc.add_widget(stack)
-        self.content.add_widget(sc)
-
-    def show_history(self, *_):
-        self.content.clear_widgets()
-
+    def command(self, kind, order):
         app = App.get_running_app()
+        exec_id = order.get("active_execution_id")
+        if not exec_id:
+            self.popup("SEM EXECUÇÃO", "Não foi encontrada execução ativa no Supabase.")
+            return
+        try:
+            {"setup": app.api.finish_setup, "pause": app.api.pause, "resume": app.api.resume}[kind](exec_id)
+            app.store.event(f'OP {order.get("op")}: comando {kind} confirmado.')
+            self.refresh_remote()
+        except Exception as e:
+            self.popup("ERRO DE COMUNICAÇÃO", str(e))
 
-        self.content.add_widget(
-            lbl(
-                "HISTÓRICO DO TABLET",
-                C_BLUE,
-                sp(11),
-                dp(24),
-                True,
-            )
-        )
+    # --------------------------------------------------------
+    # VIRADA 01:20 / HORA EXTRA
+    # --------------------------------------------------------
 
-        sc = ScrollView(
-            do_scroll_x=False
-        )
+    def check_shift_boundary(self, *_):
+        if not is_overtime_window():
+            self.shift_prompt_exec_id = None
+            return
 
-        stack = GridLayout(
-            cols=1,
-            spacing=dp(6),
-            size_hint_y=None,
-        )
+        order = self.active_order()
+        if not order:
+            return
 
-        stack.bind(
-            minimum_height=stack.setter(
-                "height"
-            )
-        )
+        exec_id = order.get("active_execution_id")
+        if not exec_id or order.get("active_hora_extra"):
+            return
 
-        for e in app.store.data.get(
-            "events",
-            [],
-        ):
-            c = Card(
-                orientation="horizontal",
-                size_hint_y=None,
-                height=dp(58),
-                padding=[
-                    dp(10),
-                    dp(7),
-                ],
-            )
-
-            c.add_widget(
-                lbl(
-                    hhmm(
-                        e.get("at")
-                    ),
-                    C_BLUE,
-                    sp(10),
-                    dp(40),
-                    True,
+        s = self.status_upper(order)
+        if s in ("EM_SETUP", "EM SETUP"):
+            if self.shift_prompt_exec_id != exec_id:
+                self.shift_prompt_exec_id = exec_id
+                self.popup(
+                    "01:20 · FIM DO T2",
+                    "A ordem ainda está em SETUP. Finalize o setup antes de seguir em hora extra.",
                 )
-            )
+            return
 
-            c.add_widget(
-                lbl(
-                    e.get(
-                        "text",
-                        "",
-                    ),
-                    C_TEXT,
-                    sp(10),
-                    dp(40),
+        if s not in ("EM_PRODUCAO", "EM PRODUCAO", "PAUSADA"):
+            return
+
+        if self.shift_prompt_exec_id == exec_id:
+            return
+        self.shift_prompt_exec_id = exec_id
+        self.open_shift_choice(order)
+
+    def open_shift_choice(self, order):
+        box = BoxLayout(orientation="vertical", padding=dp(22), spacing=dp(12))
+        box.add_widget(lbl("01:20 · FIM DO TURNO T2", C_YELLOW, sp(23), dp(46), True))
+        box.add_widget(lbl(
+            f'OP {order.get("op", "")} continua aberta.',
+            C_TEXT, sp(15), dp(36), True
+        ))
+        box.add_widget(lbl(
+            "Escolha obrigatoriamente uma ação. Se houver hora extra, primeiro será lançado tudo o que foi produzido até 01:20 e uma nova execução de HORA EXTRA será aberta a partir de 01:20.",
+            C_MUTED, sp(12), dp(92)
+        ))
+        row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(10))
+        finish = FlatButton("FINALIZAR TAREFA?", bg=C_BLUE, height=dp(62))
+        overtime = FlatButton("HORA EXTRA", bg=C_YELLOW, fg=(.04, .05, .07, 1), height=dp(62))
+        row.add_widget(finish)
+        row.add_widget(overtime)
+        box.add_widget(row)
+
+        pop = Popup(
+            title="", content=box, size_hint=(.78, .62), separator_height=0, auto_dismiss=False
+        )
+        self.shift_popup = pop
+
+        def finalize(*_):
+            pop.dismiss()
+            self.shift_popup = None
+            self.open_quantity_dialog(order, "VIRADA_TURNO")
+
+        def extra(*_):
+            pop.dismiss()
+            self.shift_popup = None
+            self.open_overtime_dialog(order)
+
+        finish.bind(on_release=finalize)
+        overtime.bind(on_release=extra)
+        pop.open()
+
+    def open_overtime_dialog(self, order):
+        exec_id = order.get("active_execution_id")
+        box = BoxLayout(orientation="vertical", padding=dp(18), spacing=dp(8))
+        box.add_widget(lbl("LANÇAR ATÉ 01:20 E SEGUIR EM HORA EXTRA", C_TEXT, sp(18), dp(44), True))
+        box.add_widget(lbl(
+            "O lançamento até 01:20 é obrigatório para abrir a continuação em HORA EXTRA.",
+            C_YELLOW, sp(11), dp(44), True
+        ))
+
+        g = GridLayout(cols=2, size_hint_y=None, height=dp(94), spacing=dp(8))
+        a = BoxLayout(orientation="vertical")
+        b = BoxLayout(orientation="vertical")
+        a.add_widget(lbl("BOAS ATÉ 01:20", C_MUTED, sp(9), dp(20), True))
+        qty = Field(hint_text="Quantidade", input_filter="float")
+        a.add_widget(qty)
+        b.add_widget(lbl("REFUGO ATÉ 01:20", C_MUTED, sp(9), dp(20), True))
+        scrap = Field(text="0", input_filter="float")
+        b.add_widget(scrap)
+        g.add_widget(a)
+        g.add_widget(b)
+        box.add_widget(g)
+        note = Field(hint_text="Observação opcional")
+        box.add_widget(note)
+        msg = lbl("", C_RED, sp(10), dp(24), True)
+        box.add_widget(msg)
+        row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+        back = FlatButton("VOLTAR")
+        ok = FlatButton("LANÇAR E INICIAR HORA EXTRA", bg=C_GREEN)
+        row.add_widget(back)
+        row.add_widget(ok)
+        box.add_widget(row)
+        pop = Popup(title="", content=box, size_hint=(.82, .78), separator_height=0, auto_dismiss=False)
+
+        def back_action(*_):
+            pop.dismiss()
+            self.shift_prompt_exec_id = None
+            Clock.schedule_once(lambda *_: self.check_shift_boundary(), .2)
+
+        back.bind(on_release=back_action)
+
+        def confirm(*_):
+            try:
+                q = float(qty.text.replace(",", "."))
+                r = float(scrap.text.replace(",", "."))
+            except Exception:
+                msg.text = "Quantidades inválidas."
+                return
+            if q <= 0:
+                msg.text = "Para seguir em hora extra é obrigatório lançar quantidade produzida até 01:20."
+                return
+            if r < 0:
+                msg.text = "Refugo não pode ser negativo."
+                return
+            try:
+                app = App.get_running_app()
+                res = app.api.overtime(exec_id, q, r, note.text.strip())
+                new_id = (res or {}).get("execution_id") if isinstance(res, dict) else None
+                app.store.event(
+                    f'OP {order.get("op")}: virada 01:20 registrada; hora extra iniciada.'
                 )
-            )
+                pop.dismiss()
+                self.shift_prompt_exec_id = new_id
+                self.refresh_remote()
+            except Exception as e:
+                msg.text = str(e)[:240]
 
-            stack.add_widget(c)
+        ok.bind(on_release=confirm)
+        pop.open()
+
+    # --------------------------------------------------------
+    # HISTÓRICO / POPUP
+    # --------------------------------------------------------
+
+    def show_history_popup(self):
+        app = App.get_running_app()
+        box = BoxLayout(orientation="vertical", padding=dp(14), spacing=dp(7))
+        box.add_widget(lbl("HISTÓRICO DA MÁQUINA", C_TEXT, sp(20), dp(38), True))
+        sc = ScrollView(do_scroll_x=False)
+        stack = GridLayout(cols=1, spacing=dp(6), size_hint_y=None)
+        stack.bind(minimum_height=stack.setter("height"))
+
+        try:
+            rows = app.api.history(self.machine.text) or []
+        except Exception as e:
+            rows = []
+            stack.add_widget(lbl(f"Falha ao carregar histórico: {e}", C_RED, sp(10), dp(60)))
+
+        for e in rows[:80]:
+            start = hhmm(e.get("inicio_em"))
+            end = hhmm(e.get("fim_em"))
+            turno = e.get("turno") or "-"
+            extra = " · HE" if e.get("hora_extra") else ""
+            qty = safe_float(e.get("quantidade_boa"))
+            text = f'{start}–{end} · {turno}{extra} · OP {e.get("op", "")} · {qty:g} pç · {e.get("operador", "")}'
+            card = Card(orientation="vertical", size_hint_y=None, height=dp(58), padding=[dp(9), dp(5)])
+            card.add_widget(lbl(text, C_TEXT, sp(10), dp(28), True))
+            if e.get("motivo_fora_fila"):
+                card.add_widget(lbl(f'Motivo: {e.get("motivo_fora_fila")}', C_MUTED, sp(8), dp(20)))
+            stack.add_widget(card)
 
         sc.add_widget(stack)
-        self.content.add_widget(sc)
+        box.add_widget(sc)
+        close = FlatButton("FECHAR", bg=C_BLUE, height=dp(46))
+        box.add_widget(close)
+        pop = Popup(title="", content=box, size_hint=(.93, .90), separator_height=0)
+        close.bind(on_release=lambda *_: pop.dismiss())
+        pop.open()
 
-    def popup(
-        self,
-        title,
-        text,
-    ):
-        box = BoxLayout(
-            orientation="vertical",
-            padding=dp(20),
-            spacing=dp(12),
-        )
-
-        box.add_widget(
-            lbl(
-                title,
-                C_TEXT,
-                sp(20),
-                dp(42),
-                True,
-            )
-        )
-
-        box.add_widget(
-            lbl(
-                text,
-                C_MUTED,
-                sp(13),
-                dp(110),
-            )
-        )
-
-        b = FlatButton(
-            "OK",
-            bg=C_BLUE,
-        )
-
+    def popup(self, title, text):
+        box = BoxLayout(orientation="vertical", padding=dp(20), spacing=dp(12))
+        box.add_widget(lbl(title, C_TEXT, sp(20), dp(42), True))
+        box.add_widget(lbl(text, C_MUTED, sp(12), dp(120)))
+        b = FlatButton("OK", bg=C_BLUE)
         box.add_widget(b)
-
-        p = Popup(
-            title="",
-            content=box,
-            size_hint=(.7, .55),
-            separator_height=0,
-        )
-
-        b.bind(
-            on_release=lambda *_:
-            p.dismiss()
-        )
-
+        p = Popup(title="", content=box, size_hint=(.72, .58), separator_height=0)
+        b.bind(on_release=lambda *_: p.dismiss())
         p.open()
 
-
-# ============================================================
-# APP
-# ============================================================
 
 class ApsSerraTabletApp(App):
     title = "APS Serra - Operação"
